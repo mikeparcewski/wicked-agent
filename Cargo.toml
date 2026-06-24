@@ -1,0 +1,27 @@
+[package]
+name = "wicked-agent"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The capstone harness — drives governance + orchestration + council on the shared wicked-estate store; plan -> distribute(council) -> execute(orchestration phases gated by governance) -> evidence; real wrapped CLIs."
+
+[lib]
+name = "wicked_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wicked-agent"
+path = "src/main.rs"
+
+[dependencies]
+apps-core = { path = "../apps-core", version = "0.1.0" }
+# Drives the three siblings in-process (cross-repo path deps).
+wicked-governance = { path = "../wicked-governance", version = "0.1.0" }
+wicked-orchestration = { path = "../wicked-orchestration", version = "0.1.0" }
+wicked-council = { path = "../wicked-council", version = "0.1.0" }
+wicked-estate-core = { path = "../wicked-estate/crates/wicked-estate-core", version = "0.12.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
