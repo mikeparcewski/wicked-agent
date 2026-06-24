@@ -1,5 +1,7 @@
 # ADR-0002 — command_iq's foundry/build-floor is a pattern, not a dependency
 
+> **Status: Holds (2026-06-24)** — no command_iq dependency; the event/phase model is re-expressed on the estate store.
+
 **Status:** Accepted (design). **Date:** 2026-06-23.
 
 ## Context

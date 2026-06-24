@@ -3,6 +3,10 @@ name = "wicked-agent"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/mikeparcewski/wicked-agent"
+keywords = ["wicked", "agents", "ai", "harness", "swarm"]
+categories = ["development-tools", "command-line-utilities"]
 description = "The capstone harness — drives governance + orchestration + council on the shared wicked-estate store; plan -> distribute(council) -> execute(orchestration phases gated by governance) -> evidence; real wrapped CLIs."
 
 [lib]

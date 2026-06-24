@@ -1,5 +1,7 @@
 # ADR-0001 — The harness wraps many CLIs; shared collection scope makes them one entity
 
+> **Status: Implemented (2026-06-24)** — Rust harness drives the three in-process on one shared estate store; shared/isolated is a collection-scope toggle.
+
 **Status:** Accepted (design). **Date:** 2026-06-23.
 
 ## Context

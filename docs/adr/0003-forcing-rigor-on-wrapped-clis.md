@@ -1,5 +1,7 @@
 # ADR-0003 — Rigor is forced by injecting governance into each wrapped CLI; the gate always fires
 
+> **Status: Implemented (2026-06-24)** — per-CLI injection + unit-level + per-tool-call governance gate on a real subprocess (mutation-proved).
+
 **Status:** Accepted (design). **Date:** 2026-06-23.
 
 ## Context
