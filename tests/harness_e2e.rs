@@ -14,7 +14,7 @@
 //! the council's own E2E) echo a canned vote naming a roster seat. The emit seam is pointed at a
 //! guaranteed-missing bus program with a temp dead-letter spool so nothing touches a real bus / HOME.
 
-use apps_core::{
+use wicked_apps_core::{
     synthetic_symbol, GraphRead, NodeKind, SqliteStore, AGENT_SESSION, CONFORMANCE_CLAIM, PHASE,
     WORK_UNIT,
 };
@@ -51,16 +51,16 @@ fn deny_secrets_policy() -> Policy {
 fn hermetic_emit() -> std::path::PathBuf {
     let spool = std::env::temp_dir().join(format!("wa-e2e-emit-{}.ndjson", std::process::id()));
     unsafe {
-        std::env::set_var(apps_core::emit::EMIT_PROGRAM_ENV, "wicked-bus-absent-xyzzy-9000");
-        std::env::set_var(apps_core::emit::DEADLETTER_ENV, &spool);
+        std::env::set_var(wicked_apps_core::emit::EMIT_PROGRAM_ENV, "wicked-bus-absent-xyzzy-9000");
+        std::env::set_var(wicked_apps_core::emit::DEADLETTER_ENV, &spool);
     }
     spool
 }
 
 fn clear_emit(spool: &std::path::Path) {
     unsafe {
-        std::env::remove_var(apps_core::emit::EMIT_PROGRAM_ENV);
-        std::env::remove_var(apps_core::emit::DEADLETTER_ENV);
+        std::env::remove_var(wicked_apps_core::emit::EMIT_PROGRAM_ENV);
+        std::env::remove_var(wicked_apps_core::emit::DEADLETTER_ENV);
     }
     let _ = std::fs::remove_file(spool);
 }
@@ -218,7 +218,7 @@ fn governance_deny_fires_through_agent_and_everything_persists_on_one_store() {
     ));
     // The recorded claim is a Deny (the durable evidence of WHY unit-1 was rejected).
     let recovered_claim = wicked_governance::claim_from_node(&claim_node).expect("decode claim");
-    assert_eq!(recovered_claim.decision, apps_core::Decision::Deny);
+    assert_eq!(recovered_claim.decision, wicked_apps_core::Decision::Deny);
     assert!(
         recovered_claim.policy_ids.contains(&"pol-deny-secrets".to_string()),
         "the deny policy participated in the claim"
@@ -238,7 +238,7 @@ fn governance_deny_fires_through_agent_and_everything_persists_on_one_store() {
     );
     assert_eq!(
         phase1.gate_decision,
-        Some(apps_core::Decision::Deny),
+        Some(wicked_apps_core::Decision::Deny),
         "the persisted phase carries the hard Deny veto marker (ADR-0003)"
     );
     assert_eq!(phase2.status, wicked_orchestration::PhaseStatus::Approved);

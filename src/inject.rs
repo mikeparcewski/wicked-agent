@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use apps_core::{ConformanceClaim, Decision, GraphRead, GraphStore};
+use wicked_apps_core::{ConformanceClaim, Decision, GraphRead, GraphStore};
 use serde::{Deserialize, Serialize};
 use wicked_governance::{decide, select};
 
@@ -409,7 +409,7 @@ pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
     let context = tool_call_context(&call, phase, scope);
 
     // Open the SAME on-disk store the in-process engine wrote the policies to.
-    let store = match apps_core::open_store(db.filter(|s| !s.is_empty())) {
+    let store = match wicked_apps_core::open_store(db.filter(|s| !s.is_empty())) {
         Ok(s) => s,
         Err(e) => {
             // Fail CLOSED.

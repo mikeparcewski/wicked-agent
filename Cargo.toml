@@ -18,7 +18,7 @@ name = "wicked-agent"
 path = "src/main.rs"
 
 [dependencies]
-apps-core = { path = "../apps-core", version = "0.1.0" }
+wicked-apps-core = { path = "../wicked-apps-core", version = "0.1.0" }
 # Drives the three siblings in-process (cross-repo path deps).
 wicked-governance = { path = "../wicked-governance", version = "0.1.0" }
 wicked-orchestration = { path = "../wicked-orchestration", version = "0.1.0" }

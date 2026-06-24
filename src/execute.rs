@@ -22,7 +22,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use apps_core::{
+use wicked_apps_core::{
     synthetic_symbol, ConformanceClaim, Decision, GraphRead, Language, Location, Node, NodeKind,
     Span, SqliteStore, ToNode, SYMBOL_SCHEME,
 };
@@ -41,7 +41,7 @@ pub const WORK_OUTPUT: &str = "work_output";
 
 /// A fixed evaluation timestamp base for claims minted by the harness. Deterministic per unit
 /// (offset by `ord`) so the same session re-derives the same claim ids without a wall clock on the
-/// decision path. (Unix-seconds; the prototype used ISO, apps-core's claim field is `i64`.)
+/// decision path. (Unix-seconds; the prototype used ISO, wicked-apps-core's claim field is `i64`.)
 const EVAL_AT_BASE: i64 = 1_750_000_000;
 
 /// The outcome of executing one unit — the harness records this back onto the unit node.

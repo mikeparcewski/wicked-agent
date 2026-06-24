@@ -2,7 +2,7 @@
 //! orchestration + council** on ONE shared wicked-estate store (the collection, finally real).
 //!
 //! This is the Rust port of the Node prototype (`wicked-agent/lib/session.mjs`, ARCHITECTURE §3:
-//! the OWNED interactive flow) onto the wicked-apps spine (`apps-core`). [`run_session`] DRIVES the
+//! the OWNED interactive flow) onto the wicked-apps spine (`wicked-apps-core`). [`run_session`] DRIVES the
 //! three sibling crates through **plan → distribute → execute**, under the estate's rigor:
 //!
 //! ```text
@@ -37,7 +37,7 @@
 //! nodes listed above. (Real agent CLIs — claude/agy/pi — are R6; here the council is driven over
 //! deterministic fake-CLI seats, exactly like the council's own tests.)
 
-use apps_core::{
+use wicked_apps_core::{
     synthetic_symbol, FromNode, GraphRead, Language, Location, Node, NodeKind, Span, SqliteStore,
     ToNode, AGENT_SESSION, SYMBOL_SCHEME, WORK_UNIT,
 };
@@ -58,10 +58,10 @@ pub use plan::plan_units;
 pub use scope::{resolve_scope, EntityMode};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Coarse bus events (counts / ids only) — mirrors the apps-core agent catalog.
+// Coarse bus events (counts / ids only) — mirrors the wicked-apps-core agent catalog.
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub use apps_core::{
+pub use wicked_apps_core::{
     EV_AGENT_PLAN_CREATED, EV_AGENT_SESSION_COMPLETED, EV_AGENT_SESSION_STARTED,
     EV_AGENT_TASK_COMPLETED, EV_AGENT_WORK_DISTRIBUTED,
 };
@@ -241,7 +241,7 @@ impl FromNode for WorkUnit {
 
 /// Upsert a node onto the shared store via the batch write path.
 pub(crate) fn put_node(store: &mut SqliteStore, node: Node) -> anyhow::Result<()> {
-    use apps_core::GraphWrite;
+    use wicked_apps_core::GraphWrite;
     store.begin_batch()?;
     store.upsert_nodes(&[node])?;
     store.commit_batch()?;
@@ -314,7 +314,7 @@ pub fn run_session(
     entity_mode: EntityMode,
     session_id: Option<&str>,
 ) -> anyhow::Result<SessionResult> {
-    use apps_core::emit::{emit_event, EmitEvent};
+    use wicked_apps_core::emit::{emit_event, EmitEvent};
 
     let session_id = session_id
         .map(str::to_string)
@@ -477,7 +477,7 @@ pub fn run_session_wrapped(
     sandbox_root: &std::path::Path,
     timeout: std::time::Duration,
 ) -> anyhow::Result<SessionResult> {
-    use apps_core::emit::{emit_event, EmitEvent};
+    use wicked_apps_core::emit::{emit_event, EmitEvent};
 
     let session_id = session_id
         .map(str::to_string)

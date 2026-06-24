@@ -18,7 +18,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use apps_core::open_store;
+use wicked_apps_core::open_store;
 use wicked_agent::{
     get_session, run_session, run_session_wrapped, scope::EntityMode, session_units, GovernanceMode,
     SessionResult,

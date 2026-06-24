@@ -91,7 +91,7 @@ fn distribute_one(
     // alongside the agent's entities — R6) when `db_path` is given, else its own in-memory ledger.
     let estate = match db_path {
         Some(path) => EstateHandle::new(
-            apps_core::SqliteStore::open(path)
+            wicked_apps_core::SqliteStore::open(path)
                 .map_err(|e| anyhow::anyhow!("open council estate on {path}: {e}"))?,
         ),
         None => EstateHandle::in_memory()

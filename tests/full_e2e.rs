@@ -24,7 +24,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use apps_core::{
+use wicked_apps_core::{
     synthetic_symbol, GraphRead, NodeKind, SqliteStore, AGENT_SESSION, CLI_RANKING, CONFORMANCE_CLAIM,
     COUNCIL_TASK, COUNCIL_VERDICT, PHASE, WORK_UNIT,
 };
@@ -72,8 +72,8 @@ fn deny_secrets_policy() -> Policy {
 fn hermetic_emit(dir: &Path) -> PathBuf {
     let spool = dir.join("emit-deadletter.ndjson");
     unsafe {
-        std::env::set_var(apps_core::emit::EMIT_PROGRAM_ENV, "wicked-bus-absent-xyzzy-9000");
-        std::env::set_var(apps_core::emit::DEADLETTER_ENV, &spool);
+        std::env::set_var(wicked_apps_core::emit::EMIT_PROGRAM_ENV, "wicked-bus-absent-xyzzy-9000");
+        std::env::set_var(wicked_apps_core::emit::DEADLETTER_ENV, &spool);
     }
     spool
 }
@@ -334,7 +334,7 @@ fn full_functional_e2e_real_cli_governed_gated_on_disk_shared_store() {
         .expect("get_node ok")
         .expect("the deny ConformanceClaim node persists on the on-disk store");
     let recovered = wicked_governance::claim_from_node(&claim_node).expect("decode claim");
-    assert_eq!(recovered.decision, apps_core::Decision::Deny);
+    assert_eq!(recovered.decision, wicked_apps_core::Decision::Deny);
 
     // Both phase nodes persist with the resolved status; the rejected one carries the Deny veto.
     let phase1 = wicked_orchestration::get_phase(&fresh, &unit1.phase_id)
@@ -344,7 +344,7 @@ fn full_functional_e2e_real_cli_governed_gated_on_disk_shared_store() {
         .expect("get phase 2")
         .expect("unit-2 phase node persists");
     assert_eq!(phase1.status, wicked_orchestration::PhaseStatus::Rejected);
-    assert_eq!(phase1.gate_decision, Some(apps_core::Decision::Deny));
+    assert_eq!(phase1.gate_decision, Some(wicked_apps_core::Decision::Deny));
     assert_eq!(phase2.status, wicked_orchestration::PhaseStatus::Approved);
 
     // The work-output node exists ONLY for the approved unit, and carries the REAL artifact metadata.
@@ -407,8 +407,8 @@ fn full_functional_e2e_real_cli_governed_gated_on_disk_shared_store() {
     unsafe {
         std::env::remove_var("WICKED_ESTATE_DB");
         std::env::remove_var("WICKED_AGENT_BIN");
-        std::env::remove_var(apps_core::emit::EMIT_PROGRAM_ENV);
-        std::env::remove_var(apps_core::emit::DEADLETTER_ENV);
+        std::env::remove_var(wicked_apps_core::emit::EMIT_PROGRAM_ENV);
+        std::env::remove_var(wicked_apps_core::emit::DEADLETTER_ENV);
     }
     let _ = std::fs::remove_file(&spool);
     let _ = std::fs::remove_dir_all(&dir);

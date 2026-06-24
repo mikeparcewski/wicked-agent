@@ -16,15 +16,15 @@ A Rust crate (`wicked_agent` lib + `wicked-agent` bin) that drives the three sib
 | Council verdict / "which CLI owns this unit" | **reuse** | `wicked-council` (in-process crate dep) |
 | Workflow phases, the reducer, the gate | **reuse** | `wicked-orchestration` (in-process crate dep) |
 | Policy decision on the work / each tool-call (`select` + `decide` + `conform`) | **reuse** | `wicked-governance` (in-process crate dep) |
-| The shared estate store + node/symbol model + the bus emit seam | **reuse** | `apps-core` over `wicked-estate` (`SqliteStore`, `Node`, `ToNode`/`FromNode`) |
+| The shared estate store + node/symbol model + the bus emit seam | **reuse** | `wicked-apps-core` over `wicked-estate` (`SqliteStore`, `Node`, `ToNode`/`FromNode`) |
 
-wicked-agent invents no event log, no policy engine, and no CLI registry. It owns the **glue** that composes the three siblings against one estate store; the authoritative records (phases, claims, council task/verdict) are the siblings'. The deps are real in-process crates (`Cargo.toml`): `wicked-governance`, `wicked-orchestration`, `wicked-council`, `apps-core`, `wicked-estate-core` — no Node harness, no JSON-over-the-wire clients.
+wicked-agent invents no event log, no policy engine, and no CLI registry. It owns the **glue** that composes the three siblings against one estate store; the authoritative records (phases, claims, council task/verdict) are the siblings'. The deps are real in-process crates (`Cargo.toml`): `wicked-governance`, `wicked-orchestration`, `wicked-council`, `wicked-apps-core`, `wicked-estate-core` — no Node harness, no JSON-over-the-wire clients.
 
 ## Data model on the estate store
 
 Every entity is a `Node` on the ONE shared `SqliteStore`, round-tripped losslessly through `Node.metadata` via the `ToNode`/`FromNode` impls in `src/lib.rs`:
 
-- **`AgentSession`** → `Node(NodeKind::Other("agent_session"))` (the `AGENT_SESSION` const from `apps-core`). Holds `workflow_id`, `problem`, `entity_mode`, `collection_scope`, the convened `clis`, and a `SessionStatus` (`Planning → Distributing → Executing → Completed`).
+- **`AgentSession`** → `Node(NodeKind::Other("agent_session"))` (the `AGENT_SESSION` const from `wicked-apps-core`). Holds `workflow_id`, `problem`, `entity_mode`, `collection_scope`, the convened `clis`, and a `SessionStatus` (`Planning → Distributing → Executing → Completed`).
 - **`WorkUnit`** → `Node(NodeKind::Other("work_unit"))` (the `WORK_UNIT` const). Created `Pending` by the plan; distribute records `assigned_cli` + `council_task_ref`; execute records `phase_ref`, `conformance_ref`, `phase_status`, `collection_scope`, and the final `UnitStatus` (`Pending → Distributed → Done | Rejected`).
 - **work outputs** → `Node(NodeKind::Other("work_output"))` (the `WORK_OUTPUT` const in `execute.rs`), written **only** when the gate approves, tagged with the unit's collection scope.
 

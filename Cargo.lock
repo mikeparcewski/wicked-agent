@@ -30,18 +30,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "apps-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "uuid",
- "wicked-estate-core",
- "wicked-estate-store",
-]
-
-[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1555,11 +1543,11 @@ name = "wicked-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "apps-core",
  "serde",
  "serde_json",
  "sha2",
  "uuid",
+ "wicked-apps-core",
  "wicked-council",
  "wicked-estate-core",
  "wicked-governance",
@@ -1567,15 +1555,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "wicked-apps-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "uuid",
+ "wicked-estate-core",
+ "wicked-estate-store",
+]
+
+[[package]]
 name = "wicked-council"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "apps-core",
  "serde",
  "serde_json",
  "toml",
  "uuid",
+ "wicked-apps-core",
  "wicked-estate-core",
  "wicked-estate-store",
 ]
@@ -1617,12 +1617,12 @@ name = "wicked-governance"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "apps-core",
  "regex",
  "serde",
  "serde_json",
  "sha2",
  "uuid",
+ "wicked-apps-core",
  "wicked-estate-core",
  "wicked-estate-store",
 ]
@@ -1632,9 +1632,9 @@ name = "wicked-orchestration"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "apps-core",
  "serde",
  "serde_json",
+ "wicked-apps-core",
 ]
 
 [[package]]
