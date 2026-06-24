@@ -117,7 +117,10 @@ fn distribute_one(
 
     let task = CouncilTask {
         id: ids::new_task_id(),
-        topic: format!("which CLI should own work unit {}: {}", unit.id, unit.description),
+        topic: format!(
+            "which CLI should own work unit {}: {}",
+            unit.id, unit.description
+        ),
         // The options are the convened seats — the council weighs WHICH seat owns the unit.
         options: roster_keys.to_vec(),
         criteria,
@@ -211,7 +214,10 @@ mod tests {
     #[test]
     fn winner_contained_in_prose_recommendation_matches_seat() {
         let roster = vec!["claude".to_string(), "agy".to_string()];
-        let st = status_with_winner(Some("Use claude for its strong refactoring"), TaskState::Voted);
+        let st = status_with_winner(
+            Some("Use claude for its strong refactoring"),
+            TaskState::Voted,
+        );
         let (cli, degraded) = pick_assignment(Some(&st), &roster);
         assert_eq!(cli, "claude");
         assert!(!degraded);
@@ -228,7 +234,10 @@ mod tests {
         let st = status_with_winner(Some("Option Z"), TaskState::Voted);
         let (cli, degraded) = pick_assignment(Some(&st), &roster);
         assert_eq!(cli, "fake-a");
-        assert!(degraded, "a winner that matches no seat is a graceful degrade");
+        assert!(
+            degraded,
+            "a winner that matches no seat is a graceful degrade"
+        );
         // Failed council (no verdict).
         let st = status_with_winner(None, TaskState::Failed);
         let (cli, degraded) = pick_assignment(Some(&st), &roster);

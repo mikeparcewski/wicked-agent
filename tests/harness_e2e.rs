@@ -14,13 +14,13 @@
 //! the council's own E2E) echo a canned vote naming a roster seat. The emit seam is pointed at a
 //! guaranteed-missing bus program with a temp dead-letter spool so nothing touches a real bus / HOME.
 
+use wicked_agent::execute::{get_work_output, WORK_OUTPUT};
+use wicked_agent::scope::EntityMode;
+use wicked_agent::{get_session, run_session, session_units, SessionStatus, UnitStatus};
 use wicked_apps_core::{
     synthetic_symbol, GraphRead, NodeKind, SqliteStore, AGENT_SESSION, CONFORMANCE_CLAIM, PHASE,
     WORK_UNIT,
 };
-use wicked_agent::execute::{get_work_output, WORK_OUTPUT};
-use wicked_agent::scope::EntityMode;
-use wicked_agent::{get_session, run_session, session_units, SessionStatus, UnitStatus};
 use wicked_council::AgenticCli;
 use wicked_governance::{register_policy, Effect, Policy, Severity, Trigger};
 
@@ -51,7 +51,10 @@ fn deny_secrets_policy() -> Policy {
 fn hermetic_emit() -> std::path::PathBuf {
     let spool = std::env::temp_dir().join(format!("wa-e2e-emit-{}.ndjson", std::process::id()));
     unsafe {
-        std::env::set_var(wicked_apps_core::emit::EMIT_PROGRAM_ENV, "wicked-bus-absent-xyzzy-9000");
+        std::env::set_var(
+            wicked_apps_core::emit::EMIT_PROGRAM_ENV,
+            "wicked-bus-absent-xyzzy-9000",
+        );
         std::env::set_var(wicked_apps_core::emit::DEADLETTER_ENV, &spool);
     }
     spool
@@ -154,9 +157,19 @@ fn governance_deny_fires_through_agent_and_everything_persists_on_one_store() {
 
     // ── The session ran to completion over exactly two units. ──
     assert_eq!(result.session_id, "sess-e2e");
-    assert_eq!(result.units.len(), 2, "the problem decomposes into two units");
-    assert_eq!(result.approved, 1, "exactly one unit (the clean one) approves");
-    assert_eq!(result.rejected, 1, "exactly one unit (the secret one) is rejected");
+    assert_eq!(
+        result.units.len(),
+        2,
+        "the problem decomposes into two units"
+    );
+    assert_eq!(
+        result.approved, 1,
+        "exactly one unit (the clean one) approves"
+    );
+    assert_eq!(
+        result.rejected, 1,
+        "exactly one unit (the secret one) is rejected"
+    );
 
     let unit1 = &result.units[0];
     let unit2 = &result.units[1];
@@ -179,7 +192,10 @@ fn governance_deny_fires_through_agent_and_everything_persists_on_one_store() {
         Some("allow"),
         "unit-2's context is clean ⇒ governance decides Allow"
     );
-    assert_eq!(unit2.phase_status, "approved", "the clean unit's phase is approved");
+    assert_eq!(
+        unit2.phase_status, "approved",
+        "the clean unit's phase is approved"
+    );
     assert!(unit2.approved);
 
     // ── (c) EVERYTHING persists on the SAME store — read back via get_node / find_symbols. ──
@@ -193,7 +209,11 @@ fn governance_deny_fires_through_agent_and_everything_persists_on_one_store() {
 
     // Both work-unit nodes (with their assignment + final status).
     let units = session_units(&store, "sess-e2e").expect("read units");
-    assert_eq!(units.len(), 2, "both work-unit nodes persist on the shared store");
+    assert_eq!(
+        units.len(),
+        2,
+        "both work-unit nodes persist on the shared store"
+    );
     assert_eq!(units[0].status, UnitStatus::Rejected);
     assert_eq!(units[1].status, UnitStatus::Done);
     assert_eq!(
@@ -220,7 +240,9 @@ fn governance_deny_fires_through_agent_and_everything_persists_on_one_store() {
     let recovered_claim = wicked_governance::claim_from_node(&claim_node).expect("decode claim");
     assert_eq!(recovered_claim.decision, wicked_apps_core::Decision::Deny);
     assert!(
-        recovered_claim.policy_ids.contains(&"pol-deny-secrets".to_string()),
+        recovered_claim
+            .policy_ids
+            .contains(&"pol-deny-secrets".to_string()),
         "the deny policy participated in the claim"
     );
 
@@ -254,7 +276,12 @@ fn governance_deny_fires_through_agent_and_everything_persists_on_one_store() {
     assert!(matches!(&out2.kind, NodeKind::Other(k) if k == WORK_OUTPUT));
 
     // Belt-and-braces: the four node kinds are all queryable on the ONE store via find_symbols.
-    for (kind, at_least) in [(AGENT_SESSION, 1), (WORK_UNIT, 2), (PHASE, 2), (CONFORMANCE_CLAIM, 1)] {
+    for (kind, at_least) in [
+        (AGENT_SESSION, 1),
+        (WORK_UNIT, 2),
+        (PHASE, 2),
+        (CONFORMANCE_CLAIM, 1),
+    ] {
         let q = wicked_estate_core::SymbolQuery {
             kinds: vec![NodeKind::Other(kind.to_string())],
             ..Default::default()
@@ -299,7 +326,10 @@ fn shared_vs_isolated_scope_on_the_same_store() {
         shared.units[0].collection_scope, shared.units[1].collection_scope,
         "shared mode: every unit's output is the SAME collection scope (one entity)"
     );
-    assert_eq!(shared.collection_scope.as_deref(), Some("wicked-agent/sess-shared/shared"));
+    assert_eq!(
+        shared.collection_scope.as_deref(),
+        Some("wicked-agent/sess-shared/shared")
+    );
 
     // ISOLATED: each unit gets its own scope, on a fresh shared store.
     let mut iso_store = SqliteStore::in_memory().unwrap();
@@ -316,7 +346,10 @@ fn shared_vs_isolated_scope_on_the_same_store() {
         isolated.units[0].collection_scope, isolated.units[1].collection_scope,
         "isolated mode: each unit gets its OWN collection scope on the same store"
     );
-    assert!(isolated.collection_scope.is_none(), "isolated has no single session scope");
+    assert!(
+        isolated.collection_scope.is_none(),
+        "isolated has no single session scope"
+    );
 
     clear_emit(&spool);
     let _ = std::fs::remove_dir_all(&dir);

@@ -37,11 +37,11 @@
 //! nodes listed above. (Real agent CLIs — claude/agy/pi — are R6; here the council is driven over
 //! deterministic fake-CLI seats, exactly like the council's own tests.)
 
+use serde::{Deserialize, Serialize};
 use wicked_apps_core::{
     synthetic_symbol, FromNode, GraphRead, Language, Location, Node, NodeKind, Span, SqliteStore,
     ToNode, AGENT_SESSION, SYMBOL_SCHEME, WORK_UNIT,
 };
-use serde::{Deserialize, Serialize};
 
 pub mod distribute;
 pub mod execute;
@@ -50,7 +50,9 @@ pub mod plan;
 pub mod scope;
 
 pub use distribute::{distribute_units, distribute_units_on, Distribution};
-pub use execute::{execute_unit, execute_unit_wrapped, UnitOutcome, DEFAULT_CLI_TIMEOUT, WORK_OUTPUT};
+pub use execute::{
+    execute_unit, execute_unit_wrapped, UnitOutcome, DEFAULT_CLI_TIMEOUT, WORK_OUTPUT,
+};
 pub use inject::{
     launch_wrapped, run_gate_hook, GovernanceMode, LaunchOutcome, ToolCall, WrappedCli,
 };
@@ -185,7 +187,12 @@ pub enum UnitStatus {
 
 impl WorkUnit {
     /// Build a fresh `Pending` unit for the plan.
-    pub fn pending(id: impl Into<String>, session_id: impl Into<String>, ord: u32, description: impl Into<String>) -> Self {
+    pub fn pending(
+        id: impl Into<String>,
+        session_id: impl Into<String>,
+        ord: u32,
+        description: impl Into<String>,
+    ) -> Self {
         WorkUnit {
             id: id.into(),
             session_id: session_id.into(),
@@ -249,7 +256,10 @@ pub(crate) fn put_node(store: &mut SqliteStore, node: Node) -> anyhow::Result<()
 }
 
 /// Read an [`AgentSession`] back from the shared store by id.
-pub fn get_session(store: &dyn GraphRead, session_id: &str) -> anyhow::Result<Option<AgentSession>> {
+pub fn get_session(
+    store: &dyn GraphRead,
+    session_id: &str,
+) -> anyhow::Result<Option<AgentSession>> {
     match store.get_node(&synthetic_symbol(AGENT_SESSION, session_id))? {
         Some(node) => Ok(Some(AgentSession::from_node(&node)?)),
         None => Ok(None),
@@ -316,9 +326,12 @@ pub fn run_session(
 ) -> anyhow::Result<SessionResult> {
     use wicked_apps_core::emit::{emit_event, EmitEvent};
 
-    let session_id = session_id
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("sess-{}", deterministic_id(&[problem, &clis.len().to_string()])));
+    let session_id = session_id.map(str::to_string).unwrap_or_else(|| {
+        format!(
+            "sess-{}",
+            deterministic_id(&[problem, &clis.len().to_string()])
+        )
+    });
     let workflow_id = format!("wf-{session_id}");
 
     let cli_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
@@ -404,7 +417,11 @@ pub fn run_session(
         u.conformance_ref = outcome.claim_id.clone();
         u.phase_status = Some(outcome.phase_status.clone());
         u.collection_scope = Some(outcome.collection_scope.clone());
-        u.status = if outcome.approved { UnitStatus::Done } else { UnitStatus::Rejected };
+        u.status = if outcome.approved {
+            UnitStatus::Done
+        } else {
+            UnitStatus::Rejected
+        };
         put_node(store, u.to_node())?;
 
         let _ = emit_event(&EmitEvent::new(
@@ -479,9 +496,12 @@ pub fn run_session_wrapped(
 ) -> anyhow::Result<SessionResult> {
     use wicked_apps_core::emit::{emit_event, EmitEvent};
 
-    let session_id = session_id
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("sess-{}", deterministic_id(&[problem, &clis.len().to_string()])));
+    let session_id = session_id.map(str::to_string).unwrap_or_else(|| {
+        format!(
+            "sess-{}",
+            deterministic_id(&[problem, &clis.len().to_string()])
+        )
+    });
     let workflow_id = format!("wf-{session_id}");
     let cli_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
     let collection_scope = match entity_mode {
@@ -524,8 +544,11 @@ pub fn run_session_wrapped(
     // The council shares the SAME on-disk file (its task/verdict land alongside the agent's entities,
     // R6) — resolved from WICKED_ESTATE_DB, which the caller exports for the gate-hook child too. The
     // agent's `store` handle is idle during distribution; the council uses its own connection.
-    let db_path = std::env::var("WICKED_ESTATE_DB").ok().filter(|p| !p.is_empty() && p != ":memory:");
-    let distributions = distribute::distribute_units_on(&units, &clis, &session_id, db_path.as_deref())?;
+    let db_path = std::env::var("WICKED_ESTATE_DB")
+        .ok()
+        .filter(|p| !p.is_empty() && p != ":memory:");
+    let distributions =
+        distribute::distribute_units_on(&units, &clis, &session_id, db_path.as_deref())?;
     for (u, dist) in units.iter_mut().zip(distributions.iter()) {
         u.assigned_cli = Some(dist.assigned_cli.clone());
         u.council_task_ref = dist.council_task_ref.clone();
@@ -545,7 +568,10 @@ pub fn run_session_wrapped(
 
     let mut outcomes: Vec<UnitOutcome> = Vec::with_capacity(units.len());
     for u in &mut units {
-        let assigned = u.assigned_cli.clone().unwrap_or_else(|| "claude".to_string());
+        let assigned = u
+            .assigned_cli
+            .clone()
+            .unwrap_or_else(|| "claude".to_string());
         let wrapped = wrapped_cli_for(&assigned, &clis, governance_mode);
         let workdir = sandbox_root.join(&session_id).join(&u.id);
         let outcome = execute::execute_unit_wrapped(
@@ -563,7 +589,11 @@ pub fn run_session_wrapped(
         u.conformance_ref = outcome.claim_id.clone();
         u.phase_status = Some(outcome.phase_status.clone());
         u.collection_scope = Some(outcome.collection_scope.clone());
-        u.status = if outcome.approved { UnitStatus::Done } else { UnitStatus::Rejected };
+        u.status = if outcome.approved {
+            UnitStatus::Done
+        } else {
+            UnitStatus::Rejected
+        };
         put_node(store, u.to_node())?;
         let _ = emit_event(&EmitEvent::new(
             EV_AGENT_TASK_COMPLETED,

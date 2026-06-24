@@ -24,11 +24,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use wicked_apps_core::{
-    synthetic_symbol, GraphRead, NodeKind, SqliteStore, AGENT_SESSION, CLI_RANKING, CONFORMANCE_CLAIM,
-    COUNCIL_TASK, COUNCIL_VERDICT, PHASE, WORK_UNIT,
-};
 use wicked_agent::{run_session_wrapped, scope::EntityMode, GovernanceMode};
+use wicked_apps_core::{
+    synthetic_symbol, GraphRead, NodeKind, SqliteStore, AGENT_SESSION, CLI_RANKING,
+    CONFORMANCE_CLAIM, COUNCIL_TASK, COUNCIL_VERDICT, PHASE, WORK_UNIT,
+};
 use wicked_council::{AgenticCli, Category, Confidence, InputMode};
 use wicked_governance::{register_policy, Effect, Policy, Severity, Trigger};
 
@@ -44,7 +44,8 @@ fn unique_tempdir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("wa-full-{tag}-{}-{nanos}-{n}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("wa-full-{tag}-{}-{nanos}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create tempdir");
     dir
 }
@@ -72,7 +73,10 @@ fn deny_secrets_policy() -> Policy {
 fn hermetic_emit(dir: &Path) -> PathBuf {
     let spool = dir.join("emit-deadletter.ndjson");
     unsafe {
-        std::env::set_var(wicked_apps_core::emit::EMIT_PROGRAM_ENV, "wicked-bus-absent-xyzzy-9000");
+        std::env::set_var(
+            wicked_apps_core::emit::EMIT_PROGRAM_ENV,
+            "wicked-bus-absent-xyzzy-9000",
+        );
         std::env::set_var(wicked_apps_core::emit::DEADLETTER_ENV, &spool);
     }
     spool
@@ -236,7 +240,11 @@ fn full_functional_e2e_real_cli_governed_gated_on_disk_shared_store() {
     }; // drop the harness handle: every read-back below uses a FRESH connection.
 
     // ── The session ran over exactly two units; one approved, one rejected. ──
-    assert_eq!(result.units.len(), 2, "the problem decomposes into two units");
+    assert_eq!(
+        result.units.len(),
+        2,
+        "the problem decomposes into two units"
+    );
     assert_eq!(result.approved, 1, "exactly the clean unit approves");
     assert_eq!(result.rejected, 1, "exactly the secret unit is rejected");
 
@@ -276,7 +284,10 @@ fn full_functional_e2e_real_cli_governed_gated_on_disk_shared_store() {
     );
 
     // ── (clean unit) the real subprocess wrote a real file; phase approved. ──
-    assert_eq!(unit2.phase_status, "approved", "the clean unit's phase is approved");
+    assert_eq!(
+        unit2.phase_status, "approved",
+        "the clean unit's phase is approved"
+    );
     assert!(unit2.approved);
     assert_eq!(
         unit2.cli_exit_code,
@@ -319,11 +330,17 @@ fn full_functional_e2e_real_cli_governed_gated_on_disk_shared_store() {
 
     // Both work-unit nodes with their final status + claim ids.
     let units = wicked_agent::session_units(&fresh, "sess-r6").expect("read units");
-    assert_eq!(units.len(), 2, "both work-unit nodes persist on the on-disk store");
+    assert_eq!(
+        units.len(),
+        2,
+        "both work-unit nodes persist on the on-disk store"
+    );
     assert_eq!(units[0].status, wicked_agent::UnitStatus::Rejected);
     assert_eq!(units[1].status, wicked_agent::UnitStatus::Done);
     assert!(
-        units.iter().all(|u| u.conformance_ref.is_some() && u.assigned_cli.is_some()),
+        units
+            .iter()
+            .all(|u| u.conformance_ref.is_some() && u.assigned_cli.is_some()),
         "each unit node carries its claim id + council assignment"
     );
 
@@ -397,7 +414,8 @@ fn full_functional_e2e_real_cli_governed_gated_on_disk_shared_store() {
         ..Default::default()
     };
     let verdict_nodes = fresh.find_symbols(&verdict_q).expect("find verdicts");
-    let verdict = wicked_council::store::verdict_from_node(&verdict_nodes[0]).expect("decode verdict");
+    let verdict =
+        wicked_council::store::verdict_from_node(&verdict_nodes[0]).expect("decode verdict");
     assert!(
         verdict.winning_recommendation.is_some(),
         "the council produced a real winning recommendation (non-degraded)"

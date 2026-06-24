@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use wicked_apps_core::{ConformanceClaim, Decision, GraphRead, GraphStore};
 use serde::{Deserialize, Serialize};
+use wicked_apps_core::{ConformanceClaim, Decision, GraphRead, GraphStore};
 use wicked_governance::{decide, select};
 
 /// The governance mode (capability) of a wrapped CLI — its gate MECHANISM (ADR-0003 step 2/3).
@@ -209,7 +209,10 @@ pub fn launch_wrapped<S: GraphRead + GraphStore>(
                     GovernanceMode::PretoolHook => "pretool hook",
                     GovernanceMode::PostHoc => "post-hoc evaluate",
                 },
-                call.tool.as_deref().or(call.command.as_deref()).unwrap_or("?")
+                call.tool
+                    .as_deref()
+                    .or(call.command.as_deref())
+                    .unwrap_or("?")
             ));
             break;
         }
@@ -377,7 +380,8 @@ fn gate_hook_exe() -> anyhow::Result<PathBuf> {
             return Ok(p);
         }
     }
-    std::env::current_exe().map_err(|e| anyhow::anyhow!("resolve current_exe for the gate hook: {e}"))
+    std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("resolve current_exe for the gate hook: {e}"))
 }
 
 #[cfg(not(unix))]
@@ -515,8 +519,14 @@ mod tests {
     #[test]
     fn resolve_out_path_joins_relative_passes_absolute() {
         let wd = Path::new("/tmp/sandbox");
-        assert_eq!(resolve_out_path("out.txt", wd), PathBuf::from("/tmp/sandbox/out.txt"));
-        assert_eq!(resolve_out_path("/etc/passwd", wd), PathBuf::from("/etc/passwd"));
+        assert_eq!(
+            resolve_out_path("out.txt", wd),
+            PathBuf::from("/tmp/sandbox/out.txt")
+        );
+        assert_eq!(
+            resolve_out_path("/etc/passwd", wd),
+            PathBuf::from("/etc/passwd")
+        );
     }
 
     #[test]

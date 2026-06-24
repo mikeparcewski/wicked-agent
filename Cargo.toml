@@ -18,12 +18,12 @@ name = "wicked-agent"
 path = "src/main.rs"
 
 [dependencies]
-wicked-apps-core = { path = "../wicked-apps-core", version = "0.1.0" }
+wicked-apps-core = "0.1.0"
 # Drives the three siblings in-process (cross-repo path deps).
-wicked-governance = { path = "../wicked-governance", version = "0.1.0" }
-wicked-orchestration = { path = "../wicked-orchestration", version = "0.1.0" }
-wicked-council = { path = "../wicked-council", version = "0.1.0" }
-wicked-estate-core = { path = "../wicked-estate/crates/wicked-estate-core", version = "0.12.0" }
+wicked-governance = "0.1.0"
+wicked-orchestration = "0.1.0"
+wicked-council = "0.1.0"
+wicked-estate-core = "0.12.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

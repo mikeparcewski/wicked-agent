@@ -18,11 +18,11 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use wicked_apps_core::open_store;
 use wicked_agent::{
-    get_session, run_session, run_session_wrapped, scope::EntityMode, session_units, GovernanceMode,
-    SessionResult,
+    get_session, run_session, run_session_wrapped, scope::EntityMode, session_units,
+    GovernanceMode, SessionResult,
 };
+use wicked_apps_core::open_store;
 use wicked_council::AgenticCli;
 
 fn main() -> ExitCode {
@@ -176,8 +176,8 @@ fn cmd_run_real(args: &[String]) -> anyhow::Result<()> {
 
 /// `status --session <id> [--db <path>]` — read the session + units + outcomes back from the store.
 fn cmd_status(args: &[String]) -> anyhow::Result<()> {
-    let session_id = flag(args, "--session")
-        .ok_or_else(|| anyhow::anyhow!("status requires --session <id>"))?;
+    let session_id =
+        flag(args, "--session").ok_or_else(|| anyhow::anyhow!("status requires --session <id>"))?;
     let db = flag(args, "--db");
     let store = open_store(db)?;
 

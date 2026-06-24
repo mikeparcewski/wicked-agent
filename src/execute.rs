@@ -22,11 +22,11 @@
 use std::path::Path;
 use std::time::Duration;
 
+use serde::Serialize;
 use wicked_apps_core::{
     synthetic_symbol, ConformanceClaim, Decision, GraphRead, Language, Location, Node, NodeKind,
     Span, SqliteStore, ToNode, SYMBOL_SCHEME,
 };
-use serde::Serialize;
 
 use wicked_governance::{conform, decide, select};
 use wicked_orchestration::{apply_event, apply_gate, get_phase, Event, Phase, PhaseStatus};
@@ -82,7 +82,10 @@ pub fn execute_unit(
     entity_mode: EntityMode,
     session_id: &str,
 ) -> anyhow::Result<UnitOutcome> {
-    let assigned_cli = unit.assigned_cli.clone().unwrap_or_else(|| "claude".to_string());
+    let assigned_cli = unit
+        .assigned_cli
+        .clone()
+        .unwrap_or_else(|| "claude".to_string());
     let phase_name = format!("unit-{}", unit.ord);
     let phase_id = format!("{workflow_id}:{phase_name}");
 
@@ -112,7 +115,13 @@ pub fn execute_unit(
     // ── 3. governance SELECT + DECIDE → a ConformanceClaim. ──
     let selected = select(store, &collection_scope, &phase_name, &context)?;
     let evaluated_at = EVAL_AT_BASE + unit.ord as i64;
-    let claim: ConformanceClaim = decide(&selected, &collection_scope, &phase_name, &context, evaluated_at);
+    let claim: ConformanceClaim = decide(
+        &selected,
+        &collection_scope,
+        &phase_name,
+        &context,
+        evaluated_at,
+    );
     let decision_token = decision_token(&claim.decision);
 
     // ── 4. the governance gate fires THROUGH orchestration (the invariant). ──
@@ -130,7 +139,13 @@ pub fn execute_unit(
 
     // ── 5. on approval: record the work-output node + durable conformance evidence. ──
     if approved {
-        let output_node = work_output_node(unit, &assigned_cli, &collection_scope, &work_output, &phase_status);
+        let output_node = work_output_node(
+            unit,
+            &assigned_cli,
+            &collection_scope,
+            &work_output,
+            &phase_status,
+        );
         put_node(store, output_node)?;
         // `conform` upserts the claim node (the durable evidence on the shared graph) + policy→claim
         // edges, then a coarse fire-and-forget event. Fire on approval (the prototype's path).
@@ -212,8 +227,13 @@ pub fn execute_unit_wrapped(
     });
     let selected = select(store, &collection_scope, &phase_name, &unit_context)?;
     let evaluated_at = EVAL_AT_BASE + unit.ord as i64;
-    let unit_claim: ConformanceClaim =
-        decide(&selected, &collection_scope, &phase_name, &unit_context, evaluated_at);
+    let unit_claim: ConformanceClaim = decide(
+        &selected,
+        &collection_scope,
+        &phase_name,
+        &unit_context,
+        evaluated_at,
+    );
     let unit_denied = unit_claim.decision == Decision::Deny;
 
     // ── 3. LAUNCH the real subprocess — ONLY if the unit-level gate allows. ──
@@ -319,19 +339,40 @@ fn real_work_output_node(
     );
     let m = &mut node.metadata;
     m.insert("unit_id".into(), serde_json::Value::String(unit.id.clone()));
-    m.insert("session_id".into(), serde_json::Value::String(unit.session_id.clone()));
-    m.insert("assigned_cli".into(), serde_json::Value::String(assigned_cli.to_string()));
-    m.insert("collection_scope".into(), serde_json::Value::String(collection_scope.to_string()));
-    m.insert("phase_status".into(), serde_json::Value::String(phase_status.to_string()));
-    m.insert("output".into(), serde_json::Value::String(output.to_string()));
+    m.insert(
+        "session_id".into(),
+        serde_json::Value::String(unit.session_id.clone()),
+    );
+    m.insert(
+        "assigned_cli".into(),
+        serde_json::Value::String(assigned_cli.to_string()),
+    );
+    m.insert(
+        "collection_scope".into(),
+        serde_json::Value::String(collection_scope.to_string()),
+    );
+    m.insert(
+        "phase_status".into(),
+        serde_json::Value::String(phase_status.to_string()),
+    );
+    m.insert(
+        "output".into(),
+        serde_json::Value::String(output.to_string()),
+    );
     m.insert("real_cli".into(), serde_json::Value::Bool(true));
     if let Some(l) = launch {
         m.insert("exit_code".into(), serde_json::json!(l.exit_code));
-        m.insert("gate_timing".into(), serde_json::Value::String(l.gate_timing.clone()));
+        m.insert(
+            "gate_timing".into(),
+            serde_json::Value::String(l.gate_timing.clone()),
+        );
         if let Some(p) = &l.artifact_path {
             m.insert("artifact_path".into(), serde_json::Value::String(p.clone()));
         }
-        m.insert("tool_call_count".into(), serde_json::json!(l.tool_calls.len()));
+        m.insert(
+            "tool_call_count".into(),
+            serde_json::json!(l.tool_calls.len()),
+        );
     }
     node
 }
@@ -379,11 +420,26 @@ fn work_output_node(
     );
     let m = &mut node.metadata;
     m.insert("unit_id".into(), serde_json::Value::String(unit.id.clone()));
-    m.insert("session_id".into(), serde_json::Value::String(unit.session_id.clone()));
-    m.insert("assigned_cli".into(), serde_json::Value::String(assigned_cli.to_string()));
-    m.insert("collection_scope".into(), serde_json::Value::String(collection_scope.to_string()));
-    m.insert("phase_status".into(), serde_json::Value::String(phase_status.to_string()));
-    m.insert("output".into(), serde_json::Value::String(output.to_string()));
+    m.insert(
+        "session_id".into(),
+        serde_json::Value::String(unit.session_id.clone()),
+    );
+    m.insert(
+        "assigned_cli".into(),
+        serde_json::Value::String(assigned_cli.to_string()),
+    );
+    m.insert(
+        "collection_scope".into(),
+        serde_json::Value::String(collection_scope.to_string()),
+    );
+    m.insert(
+        "phase_status".into(),
+        serde_json::Value::String(phase_status.to_string()),
+    );
+    m.insert(
+        "output".into(),
+        serde_json::Value::String(output.to_string()),
+    );
     node
 }
 

@@ -57,7 +57,10 @@ mod tests {
     fn shared_pins_all_to_one_scope() {
         let a = resolve_scope(EntityMode::Shared, "s1", "u1");
         let b = resolve_scope(EntityMode::Shared, "s1", "u2");
-        assert_eq!(a, b, "shared mode: every unit shares ONE scope (one entity)");
+        assert_eq!(
+            a, b,
+            "shared mode: every unit shares ONE scope (one entity)"
+        );
         assert_eq!(a, "wicked-agent/s1/shared");
     }
 

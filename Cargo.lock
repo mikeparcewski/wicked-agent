@@ -1557,6 +1557,8 @@ dependencies = [
 [[package]]
 name = "wicked-apps-core"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "838e2ad60bb2894bf0e03c17e77c9d3293d8a2b1efcb207c4f1051e1f5e307e4"
 dependencies = [
  "anyhow",
  "serde",
@@ -1569,6 +1571,8 @@ dependencies = [
 [[package]]
 name = "wicked-council"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc26d2e6df2d5382a54d330732ccba68e6b365bb083186e7f6e5dde858bad0c1"
 dependencies = [
  "anyhow",
  "serde",
@@ -1583,6 +1587,8 @@ dependencies = [
 [[package]]
 name = "wicked-estate-core"
 version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94877bd86279bb9b59e1b2a65922dd2e24610fcc38c7dc18ab1fedcde20f7ab3"
 dependencies = [
  "async-trait",
  "serde",
@@ -1593,6 +1599,8 @@ dependencies = [
 [[package]]
 name = "wicked-estate-observe"
 version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "440de9ddb96efe717e3edd2900b29723ec3ff1cf53b5d1b5f5afc8c76e545153"
 dependencies = [
  "reqwest",
  "serde_json",
@@ -1602,6 +1610,8 @@ dependencies = [
 [[package]]
 name = "wicked-estate-store"
 version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1973cb11441654528d008eb56551a057da57f7e0f5dc63841b5f9d3c74674581"
 dependencies = [
  "rusqlite",
  "serde",
@@ -1615,6 +1625,8 @@ dependencies = [
 [[package]]
 name = "wicked-governance"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02b9b272b2426a14124c7f50b9a5fa3abe92abbc0c4f3163a389f2a936fdbe33"
 dependencies = [
  "anyhow",
  "regex",
@@ -1630,6 +1642,8 @@ dependencies = [
 [[package]]
 name = "wicked-orchestration"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66e527079dd82bac89ec7337e87abfc02544ae085e404f08469c6807d90f9fb4"
 dependencies = [
  "anyhow",
  "serde",

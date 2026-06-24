@@ -1,0 +1,27 @@
+name: Publish
+
+# Fires when a version tag (e.g. v0.1.0) is pushed.
+# Prereq: set CARGO_REGISTRY_TOKEN in repo Settings → Secrets → Actions.
+# scripts/publish.sh skips the crate if that version is already on crates.io,
+# so re-running a failed publish is safe.
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: publish to crates.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: publish (resumable, rate-limit-aware)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: bash scripts/publish.sh

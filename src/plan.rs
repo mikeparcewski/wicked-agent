@@ -16,7 +16,11 @@ pub fn plan_units(problem: &str, session_id: &str) -> Vec<WorkUnit> {
     let pieces: Vec<String> = split_problem(problem);
     let descriptions: Vec<String> = if pieces.is_empty() {
         let trimmed = problem.trim();
-        vec![if trimmed.is_empty() { "unit".to_string() } else { trimmed.to_string() }]
+        vec![if trimmed.is_empty() {
+            "unit".to_string()
+        } else {
+            trimmed.to_string()
+        }]
     } else {
         pieces
     };
@@ -122,6 +126,10 @@ mod tests {
     fn decimal_point_does_not_split() {
         // "3.5" must NOT split (terminator not followed by whitespace).
         let units = plan_units("Upgrade to version 3.5 now", "s");
-        assert_eq!(units.len(), 1, "a decimal point mid-token is not a boundary");
+        assert_eq!(
+            units.len(),
+            1,
+            "a decimal point mid-token is not a boundary"
+        );
     }
 }
