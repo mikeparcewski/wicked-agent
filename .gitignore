@@ -1,0 +1,12 @@
+target/
+node_modules/
+.DS_Store
+*.db
+*.db-shm
+*.db-wal
+.wicked-vault/
+.wicked-governance/
+.wicked-orchestration/
+.wicked-council/
+.wicked-agent/
+.wicked-estate/
