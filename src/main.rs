@@ -43,12 +43,13 @@ fn main() -> ExitCode {
         "run" => cmd_run(&args[1..]),
         "run-real" => cmd_run_real(&args[1..]),
         "status" => cmd_status(&args[1..]),
+        "register-policy" => cmd_register_policy(&args[1..]),
         "health" => {
             println!("{}", wicked_agent::health());
             Ok(())
         }
         other => Err(anyhow::anyhow!(
-            "unknown command {other:?}; expected one of: run, run-real, status, gate-hook, health"
+            "unknown command {other:?}; expected one of: run, run-real, status, register-policy, gate-hook, health"
         )),
     };
 
@@ -194,6 +195,48 @@ fn cmd_status(args: &[String]) -> anyhow::Result<()> {
         "rejected": units.iter().filter(|u| matches!(u.status, wicked_agent::UnitStatus::Rejected)).count(),
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+/// `register-policy --phase <p> [--effect deny|allow|allow-with-conditions] [--trigger <regex>]
+///                  [--id <id>] [--rule <text>] [--db <path>]`.
+///
+/// Seeds a REAL governance [`Policy`](wicked_governance::Policy) onto the shared store so the
+/// `gate-hook` enforces it — the policy path, not a vacuous allow. `--trigger` is a regex matched
+/// over the evaluated tool-call context JSON; `--phase` is what the policy is selected for (must
+/// match the phase the gate-hook runs under). Default effect is `deny`.
+fn cmd_register_policy(args: &[String]) -> anyhow::Result<()> {
+    let phase = flag(args, "--phase")
+        .ok_or_else(|| anyhow::anyhow!("register-policy requires --phase <phase>"))?;
+    let id = flag(args, "--id").unwrap_or("policy-1");
+    let effect = match flag(args, "--effect") {
+        Some("allow") => wicked_governance::Effect::Allow,
+        Some("allow-with-conditions") => wicked_governance::Effect::AllowWithConditions,
+        _ => wicked_governance::Effect::Deny,
+    };
+    let trigger = wicked_governance::Trigger {
+        contains: flag(args, "--trigger").map(str::to_string),
+    };
+    let db = flag(args, "--db");
+    let mut store = open_store(db)?;
+    let policy = wicked_governance::Policy {
+        id: id.to_string(),
+        kind: "security".to_string(),
+        applies_to: vec![phase.to_string()],
+        effect,
+        trigger,
+        obligations: Vec::new(),
+        criteria: format!("registered policy {id} for phase {phase}"),
+        severity: wicked_governance::Severity::High,
+        rule: flag(args, "--rule")
+            .unwrap_or("registered via `wicked-agent register-policy`")
+            .to_string(),
+    };
+    wicked_governance::register_policy(&mut store, &policy)?;
+    println!(
+        "registered policy {id}: effect={:?} phase={phase} trigger={:?}",
+        policy.effect, policy.trigger.contains
+    );
     Ok(())
 }
 

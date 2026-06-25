@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use wicked_apps_core::{ConformanceClaim, Decision, GraphRead, GraphStore};
-use wicked_governance::{decide, select};
+use wicked_governance::{conform, decide, select};
 
 /// The governance mode (capability) of a wrapped CLI — its gate MECHANISM (ADR-0003 step 2/3).
 /// The gate ALWAYS fires; only its TIMING degrades.
@@ -401,44 +401,105 @@ fn write_pretool_hook(dir: &Path, scope: &str, phase: &str) -> anyhow::Result<Pa
     Ok(hook_path)
 }
 
-/// The `gate-hook` subcommand body: read a proposed tool-call JSON on stdin, open the on-disk store,
-/// run governance `select`+`decide` over the call's context, print the decision JSON, and return the
-/// gate exit code (2 = DENY ⇒ the CLI must abort; 0 = allow). Fails CLOSED: if governance cannot
-/// decide, the gate DENIES (rigor is unavoidable). This is the in-subprocess half of the pre-hook.
+/// Map a tool-call event onto the governance evaluation context. Accepts BOTH shapes:
+/// - Claude Code's REAL **PreToolUse** event `{ "tool_name", "tool_input": { … } }` (verified against
+///   claude 2.1.191) — the contract a real `claude` subprocess pipes to its hook's stdin;
+/// - the prototype's LEGACY flat shape `{ "tool", "command", "path", "content" }` ([`ToolCall`]), still
+///   emitted by `launch_wrapped`'s fake-agent path until that path is rewired to Claude's settings.
+///
+/// Reads `tool_input` first, then falls back to the top-level object, so the SAME policies fire either
+/// way. `tool_input` keys vary by tool: `Bash{command}`, `Write{file_path,content}`,
+/// `Edit{file_path,new_string}`, `Read{file_path}`, …. Returns the context plus the tool name.
+fn claude_pretool_context(raw: &str, scope: &str, phase: &str) -> (serde_json::Value, String) {
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or(serde_json::Value::Null);
+    let tool = v
+        .get("tool_name")
+        .or_else(|| v.get("tool"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    // Claude nests the call under `tool_input`; the legacy flat shape puts the fields at top level.
+    let input = v.get("tool_input").cloned().unwrap_or_else(|| v.clone());
+    let get = |k: &str| {
+        input
+            .get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let command = get("command");
+    let path = get("file_path")
+        .or_else(|| get("path"))
+        .or_else(|| get("notebook_path"));
+    let content = get("content")
+        .or_else(|| get("new_string"))
+        .or_else(|| get("new_str"));
+    // The string a deny policy's `contains` regex matches over — the most specific available.
+    let work = command
+        .clone()
+        .or_else(|| content.clone())
+        .or_else(|| path.clone())
+        .unwrap_or_else(|| tool.clone());
+    let context = serde_json::json!({
+        "phase": phase,
+        "scope": scope,
+        "tool": tool,
+        "command": command,
+        "path": path,
+        "content": content,
+        "args": input,
+        "work": work,
+    });
+    (context, tool)
+}
+
+/// The `gate-hook` subcommand body: the REAL Claude PreToolUse hook. Reads Claude's event JSON
+/// (`{tool_name, tool_input, …}`) on stdin, opens the on-disk store, runs governance `select`+`decide`
+/// over the call's context, **persists the resulting `ConformanceClaim` as durable evidence**, writes
+/// any deny reason to stderr (Claude surfaces it to the model), and returns the gate exit code
+/// (2 = DENY ⇒ Claude aborts the tool-call BEFORE it runs; 0 = allow). Fails CLOSED: if the store
+/// cannot be opened or governance cannot decide, the gate DENIES. Prints nothing to stdout (Claude
+/// parses hook stdout; we keep it clean and signal purely via exit code + stderr — the proven shape).
 pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
     use std::io::Read;
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
-    let call: ToolCall = serde_json::from_str(raw.trim()).unwrap_or_default();
-    let context = tool_call_context(&call, phase, scope);
+    let (context, tool) = claude_pretool_context(&raw, scope, phase);
 
-    // Open the SAME on-disk store the in-process engine wrote the policies to.
-    let store = match wicked_apps_core::open_store(db.filter(|s| !s.is_empty())) {
+    // Open the SAME on-disk store the in-process engine registered the policies on (mutable: we
+    // persist the decision as the run's durable evidence). Fail CLOSED on any error.
+    let mut store = match wicked_apps_core::open_store(db.filter(|s| !s.is_empty())) {
         Ok(s) => s,
         Err(e) => {
-            // Fail CLOSED.
-            println!("{{\"decision\":\"deny\",\"reason\":\"open store failed: {e}\"}}");
+            eprintln!("wicked-governance: DENY (open store failed: {e})");
             return 2;
         }
     };
     let selected = match select(&store, scope, phase, &context) {
         Ok(s) => s,
         Err(e) => {
-            println!("{{\"decision\":\"deny\",\"reason\":\"select failed: {e}\"}}");
+            eprintln!("wicked-governance: DENY (policy select failed: {e})");
             return 2;
         }
     };
     let claim = decide(&selected, scope, phase, &context, EVAL_AT_BASE);
-    let denied = claim.decision == Decision::Deny;
-    println!(
-        "{{\"decision\":\"{}\",\"claim_id\":\"{}\"}}",
-        decision_str(&claim.decision),
-        claim.claim_id
-    );
-    if denied {
-        2
-    } else {
-        0
+    // Record the decision on the shared store (best-effort; the verdict already stands).
+    if let Err(e) = conform(&mut store, &claim) {
+        eprintln!(
+            "wicked-governance: NOTE — failed to persist claim {}: {e}",
+            claim.claim_id
+        );
+    }
+    match claim.decision {
+        Decision::Deny => {
+            let t = if tool.is_empty() {
+                "tool-call"
+            } else {
+                tool.as_str()
+            };
+            eprintln!("wicked-governance: DENY `{t}` (claim {})", claim.claim_id);
+            2
+        }
+        _ => 0,
     }
 }
 
