@@ -1543,6 +1543,7 @@ name = "wicked-agent"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

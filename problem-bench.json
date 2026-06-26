@@ -1,0 +1,19 @@
+{
+  "problem": "Benchmark unit 1; Benchmark unit 2; Benchmark unit 3; Benchmark unit 4; Benchmark unit 5; Benchmark unit 6; Benchmark unit 7; Benchmark unit 8; Benchmark unit 9; Benchmark unit 10; Benchmark unit 11; Benchmark unit 12; Benchmark unit 13; Benchmark unit 14; Benchmark unit 15; Benchmark unit 16; Benchmark unit 17; Benchmark unit 18; Benchmark unit 19; Benchmark unit 20",
+  "session_id": "bench-problem-json-20",
+  "clis": [
+    {
+      "key": "stub",
+      "display_name": "Stub (bench)",
+      "binary": "wicked-agent",
+      "headless_invocation": "wicked-agent health",
+      "category": "agentic-coder",
+      "input_mode": "prompt-arg",
+      "version_probe": [],
+      "trust_flags": [],
+      "alt_binaries": [],
+      "confidence": "verified",
+      "enabled_for_council": true
+    }
+  ]
+}

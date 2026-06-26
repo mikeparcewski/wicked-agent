@@ -29,3 +29,9 @@ serde_json = "1"
 anyhow = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
+
+[dev-dependencies]
+# Raw rusqlite access for EXPLAIN QUERY PLAN in the cogiq-scale benchmark (Task #29).
+# Must match the version bundled transitively by wicked-estate-store.
+rusqlite = { version = "0.32", features = ["bundled"] }
+anyhow = "1"
