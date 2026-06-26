@@ -1031,4 +1031,309 @@ mod tests {
         unsafe { std::env::remove_var("WICKED_AGENT_BIN") };
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── discover_toolbox / resolve_mcp_binary determinism tests ─────────────────
+    //
+    // ADVERSARIAL CHALLENGE — env-var determinism. `discover_toolbox` / `resolve_mcp_binary`
+    // read PROCESS-GLOBAL env (`WICKED_*_MCP_BIN`, `PATH`, `CARGO_HOME`, `HOME`, `USERPROFILE`).
+    // Rust runs tests in PARALLEL, so naive env mutation races. WORSE: this machine may HAVE the
+    // three real servers installed in `~/.cargo/bin`, so the cargo-home fallback would resolve a
+    // binary regardless of the env-override — a naive "missing → omitted" assertion is NOT
+    // deterministic. Each test below LOCKS `ENV_LOCK` (serializing all env-mutating tests against
+    // each other) and uses `EnvGuard` to SAVE every env var it touches, SET controlled values, and
+    // RESTORE on Drop (so even a panicking assertion cannot leak mutation). To prove "missing →
+    // omitted" we must neutralize ALL THREE resolution layers: env-override → nonexistent path,
+    // PATH → an empty temp dir, and the cargo-home fallback → CARGO_HOME/HOME/USERPROFILE all
+    // pointed at an empty temp dir with no `.cargo/bin/<binary>`.
+
+    /// Serializes every test that mutates process-global env. ALL env-touching tests must lock this.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Save/restore guard for a set of env vars. On construction it records the current value (or
+    /// absence) of each named var; on Drop it restores them exactly — present vars are re-set to
+    /// their old value, absent vars are removed. This neutralizes leakage across the shared process.
+    struct EnvGuard {
+        saved: Vec<(String, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        /// Snapshot the current values of `keys`.
+        fn capture(keys: &[&str]) -> Self {
+            let saved = keys
+                .iter()
+                .map(|k| ((*k).to_string(), std::env::var_os(k)))
+                .collect();
+            EnvGuard { saved }
+        }
+
+        /// Set a var to a controlled value (within the lock).
+        fn set(&self, key: &str, val: impl AsRef<std::ffi::OsStr>) {
+            // Safety: serialized by ENV_LOCK; restored on Drop. Matches the file's existing pattern.
+            unsafe { std::env::set_var(key, val) };
+        }
+
+        /// Remove a var entirely (within the lock).
+        fn remove(&self, key: &str) {
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(val) => unsafe { std::env::set_var(k, val) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+        }
+    }
+
+    /// The full set of env vars `resolve_mcp_binary` reads — every layer's input. We neutralize ALL
+    /// of them so each test isolates exactly the layer it intends to exercise.
+    const RESOLVER_ENV: &[&str] = &[
+        "WICKED_ESTATE_MCP_BIN",
+        "WICKED_MEMORY_MCP_BIN",
+        "WICKED_KNOWLEDGE_MCP_BIN",
+        "PATH",
+        "CARGO_HOME",
+        "HOME",
+        "USERPROFILE",
+    ];
+
+    /// Point PATH + CARGO_HOME + HOME + USERPROFILE at an EMPTY temp dir, so the PATH probe and the
+    /// cargo-home fallback can resolve NOTHING. Caller still controls the per-server env-overrides.
+    /// Returns the empty dir (kept alive for the test's lifetime).
+    fn neutralize_path_and_cargo_home(guard: &EnvGuard, tag: &str) -> std::path::PathBuf {
+        let empty = std::env::temp_dir().join(format!(
+            "wa-empty-{}-{}-{:?}",
+            tag,
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).unwrap();
+        // Empty PATH dir → PATH probe finds no binaries.
+        guard.set("PATH", &empty);
+        // CARGO_HOME → <empty>; cargo-home fallback looks at <empty>/bin/<binary> (absent).
+        guard.set("CARGO_HOME", &empty);
+        // HOME / USERPROFILE → <empty>; the derived `~/.cargo/bin/<binary>` is also absent.
+        guard.set("HOME", &empty);
+        guard.set("USERPROFILE", &empty);
+        empty
+    }
+
+    /// env-override → INCLUDED: a `WICKED_ESTATE_MCP_BIN` pointed at a REAL existing file must make
+    /// `wicked-estate` appear in the specs with EXACTLY that command path — the override is the
+    /// highest-priority layer and wins over PATH and cargo-home.
+    #[cfg(unix)]
+    #[test]
+    fn discover_toolbox_env_override_includes_server_with_exact_path() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::capture(RESOLVER_ENV);
+
+        // Neutralize the lower layers so the ONLY thing that can resolve estate is our override.
+        let empty = neutralize_path_and_cargo_home(&guard, "ovr");
+
+        // A real existing temp file to stand in for the estate binary.
+        let fake_estate = empty.join("real-wicked-estate-mcp");
+        std::fs::write(&fake_estate, b"#!/bin/sh\n").unwrap();
+        assert!(fake_estate.exists());
+
+        guard.set("WICKED_ESTATE_MCP_BIN", &fake_estate);
+        // The other two have NO override and cannot be resolved by any neutralized layer → omitted.
+        guard.remove("WICKED_MEMORY_MCP_BIN");
+        guard.remove("WICKED_KNOWLEDGE_MCP_BIN");
+
+        let specs = discover_toolbox();
+
+        let estate = specs
+            .iter()
+            .find(|s| s.name == "wicked-estate")
+            .expect("env-override must include wicked-estate");
+        assert_eq!(
+            estate.command,
+            fake_estate.display().to_string(),
+            "the override path must be used verbatim as the command"
+        );
+        assert!(
+            !specs.iter().any(|s| s.name == "wicked-memory"),
+            "wicked-memory has no override and no resolvable layer → must be omitted"
+        );
+        assert!(
+            !specs.iter().any(|s| s.name == "wicked-knowledge"),
+            "wicked-knowledge has no override and no resolvable layer → must be omitted"
+        );
+
+        let _ = std::fs::remove_dir_all(&empty);
+        // guard drops here → all RESOLVER_ENV restored.
+    }
+
+    /// all-missing → OMITTED + empty/graceful: with every override pointed at a NONEXISTENT path AND
+    /// PATH + cargo-home neutralized, NO server resolves → `discover_toolbox()` returns an EMPTY Vec,
+    /// and `write_mcp_config(workdir, &specs)` returns `None` (no file). This is the graceful-
+    /// degradation invariant: a fully-unresolvable toolbox is not a hard error.
+    #[cfg(unix)]
+    #[test]
+    fn discover_toolbox_all_missing_returns_empty_and_no_config() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::capture(RESOLVER_ENV);
+
+        let empty = neutralize_path_and_cargo_home(&guard, "missing");
+
+        // Every override points at a path that does NOT exist → layer 1 fails its `.exists()` check.
+        let nonexistent = empty.join("does-not-exist-anywhere");
+        assert!(!nonexistent.exists());
+        guard.set("WICKED_ESTATE_MCP_BIN", &nonexistent);
+        guard.set("WICKED_MEMORY_MCP_BIN", &nonexistent);
+        guard.set("WICKED_KNOWLEDGE_MCP_BIN", &nonexistent);
+
+        let specs = discover_toolbox();
+        assert!(
+            specs.is_empty(),
+            "no layer can resolve any server → specs must be empty, got: {specs:?}"
+        );
+
+        // Graceful degradation: an empty toolbox yields NO mcp.json (and no flag downstream).
+        let workdir = empty.join("work");
+        let cfg = write_mcp_config(&workdir, &specs).unwrap();
+        assert!(cfg.is_none(), "empty specs must produce no mcp.json");
+        assert!(
+            !workdir.join(".claude").join("mcp.json").exists(),
+            "no mcp.json file may be written for an empty toolbox"
+        );
+
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// partial toolbox → GRACEFUL: exactly ONE server resolvable (estate via a real-file override),
+    /// the other TWO unresolvable. `discover_toolbox()` must return EXACTLY the one resolvable spec —
+    /// proving the harness degrades to a partial toolbox rather than all-or-nothing. The written
+    /// mcp.json must contain only that one server.
+    #[cfg(unix)]
+    #[test]
+    fn discover_toolbox_partial_toolbox_includes_only_resolvable() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::capture(RESOLVER_ENV);
+
+        let empty = neutralize_path_and_cargo_home(&guard, "partial");
+
+        // estate resolves via a real-file override; memory + knowledge point at a nonexistent path.
+        let fake_estate = empty.join("real-wicked-estate-mcp");
+        std::fs::write(&fake_estate, b"#!/bin/sh\n").unwrap();
+        let nonexistent = empty.join("nope");
+        assert!(!nonexistent.exists());
+        guard.set("WICKED_ESTATE_MCP_BIN", &fake_estate);
+        guard.set("WICKED_MEMORY_MCP_BIN", &nonexistent);
+        guard.set("WICKED_KNOWLEDGE_MCP_BIN", &nonexistent);
+
+        let specs = discover_toolbox();
+        assert_eq!(
+            specs.len(),
+            1,
+            "exactly one server is resolvable → exactly one spec, got: {specs:?}"
+        );
+        assert_eq!(specs[0].name, "wicked-estate");
+        assert_eq!(specs[0].command, fake_estate.display().to_string());
+
+        // The written config must carry only the resolvable server.
+        let workdir = empty.join("work");
+        let cfg = write_mcp_config(&workdir, &specs)
+            .unwrap()
+            .expect("a one-spec toolbox must write a config");
+        let content = std::fs::read_to_string(&cfg).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let servers = v["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.len(), 1, "config must contain exactly one server");
+        assert!(servers.contains_key("wicked-estate"));
+        assert!(!servers.contains_key("wicked-memory"));
+        assert!(!servers.contains_key("wicked-knowledge"));
+
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// resolve_mcp_binary: an env-override pointing at a NONEXISTENT path must NOT be returned — the
+    /// `.exists()` guard rejects it, forcing fall-through to the next layer. With PATH + cargo-home
+    /// neutralized, the result is `None`. Pins the exact layer-1 semantics (override is path-checked,
+    /// not blindly trusted).
+    #[cfg(unix)]
+    #[test]
+    fn resolve_mcp_binary_nonexistent_override_falls_through_to_none() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::capture(RESOLVER_ENV);
+
+        let empty = neutralize_path_and_cargo_home(&guard, "fallthrough");
+        let nonexistent = empty.join("ghost-binary");
+        guard.set("WICKED_ESTATE_MCP_BIN", &nonexistent);
+
+        let resolved = resolve_mcp_binary("wicked-estate-mcp", "WICKED_ESTATE_MCP_BIN");
+        assert!(
+            resolved.is_none(),
+            "a nonexistent override + neutralized PATH/cargo-home must resolve to None, got: {resolved:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// resolve_mcp_binary: PATH-probe layer. With the env-override absent and cargo-home neutralized,
+    /// a binary placed in a PATH dir must be found and returned with its full path. Proves layer 2.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_mcp_binary_finds_binary_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::capture(RESOLVER_ENV);
+
+        let empty = neutralize_path_and_cargo_home(&guard, "pathprobe");
+        // Override absent → layer 1 skipped; cargo-home neutralized → layer 3 finds nothing.
+        guard.remove("WICKED_MEMORY_MCP_BIN");
+
+        // Put a real executable named exactly like the binary into a PATH dir.
+        let path_dir = empty.join("pathbin");
+        std::fs::create_dir_all(&path_dir).unwrap();
+        let on_path = path_dir.join("wicked-memory-mcp");
+        std::fs::write(&on_path, b"#!/bin/sh\n").unwrap();
+        let mut perm = std::fs::metadata(&on_path).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&on_path, perm).unwrap();
+        guard.set("PATH", &path_dir);
+
+        let resolved = resolve_mcp_binary("wicked-memory-mcp", "WICKED_MEMORY_MCP_BIN");
+        assert_eq!(
+            resolved,
+            Some(on_path.display().to_string()),
+            "the PATH probe must return the binary found on PATH"
+        );
+
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// resolve_mcp_binary: cargo-home fallback (layer 3). With the override absent and PATH empty,
+    /// a binary at `$CARGO_HOME/bin/<binary>` must be found. Proves the last-resort layer fires.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_mcp_binary_finds_binary_in_cargo_home() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::capture(RESOLVER_ENV);
+
+        let empty = neutralize_path_and_cargo_home(&guard, "cargohome");
+        guard.remove("WICKED_KNOWLEDGE_MCP_BIN");
+
+        // Build a CARGO_HOME with bin/<binary> present.
+        let cargo_home = empty.join("cargo");
+        let cargo_bin = cargo_home.join("bin");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        let installed = cargo_bin.join("wicked-knowledge-mcp");
+        std::fs::write(&installed, b"#!/bin/sh\n").unwrap();
+        guard.set("CARGO_HOME", &cargo_home);
+
+        let resolved = resolve_mcp_binary("wicked-knowledge-mcp", "WICKED_KNOWLEDGE_MCP_BIN");
+        assert_eq!(
+            resolved,
+            Some(installed.display().to_string()),
+            "the cargo-home fallback must return $CARGO_HOME/bin/<binary>"
+        );
+
+        let _ = std::fs::remove_dir_all(&empty);
+    }
 }
