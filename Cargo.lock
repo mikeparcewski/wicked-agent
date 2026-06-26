@@ -1625,6 +1625,8 @@ dependencies = [
 [[package]]
 name = "wicked-governance"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f82f57828b4c93c5b4b8c58985d47547c363578a06e9b022afac818a3f5ec8d"
 dependencies = [
  "anyhow",
  "regex",
@@ -1640,6 +1642,8 @@ dependencies = [
 [[package]]
 name = "wicked-orchestration"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20132f45e5d5f3b1a0e55c6be8b36d5a6386e7f0a86274a54b915a8cb5598133"
 dependencies = [
  "anyhow",
  "serde",
