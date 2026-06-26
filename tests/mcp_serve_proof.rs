@@ -146,9 +146,9 @@ fn serve_tool_names(bin: &PathBuf, db_env: &[(&str, PathBuf)], server_label: &st
                 "{server_label} initialize must report a serverInfo.name"
             );
         } else if id == Some(2) {
-            let arr = v["result"]["tools"]
-                .as_array()
-                .unwrap_or_else(|| panic!("{server_label} tools/list result.tools must be an array"));
+            let arr = v["result"]["tools"].as_array().unwrap_or_else(|| {
+                panic!("{server_label} tools/list result.tools must be an array")
+            });
             let mut names: Vec<String> = arr
                 .iter()
                 .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_string))
@@ -160,7 +160,10 @@ fn serve_tool_names(bin: &PathBuf, db_env: &[(&str, PathBuf)], server_label: &st
     }
 
     drop(guard); // explicit kill + reap
-    assert!(saw_init, "{server_label} never answered initialize before tools/list");
+    assert!(
+        saw_init,
+        "{server_label} never answered initialize before tools/list"
+    );
     tools.unwrap_or_else(|| panic!("{server_label} did not return a tools/list response in time"))
 }
 
@@ -169,7 +172,9 @@ fn serve_tool_names(bin: &PathBuf, db_env: &[(&str, PathBuf)], server_label: &st
 #[test]
 fn memory_mcp_serves_six_tools() {
     let Some(bin) = resolve_bin("wicked-memory-mcp", "WICKED_MEMORY_MCP_BIN") else {
-        eprintln!("SKIP: wicked-memory-mcp not found (env/PATH/~/.cargo/bin) — install to run this proof");
+        eprintln!(
+            "SKIP: wicked-memory-mcp not found (env/PATH/~/.cargo/bin) — install to run this proof"
+        );
         return;
     };
 
@@ -180,7 +185,8 @@ fn memory_mcp_serves_six_tools() {
         "wicked-memory-mcp",
     );
 
-    let mut expected = vec![
+    // Documented roster, in sorted order (matches `names`, which is sorted).
+    let expected = [
         "memory.capture",
         "memory.coverage",
         "memory.erase",
@@ -188,7 +194,6 @@ fn memory_mcp_serves_six_tools() {
         "memory.recall",
         "memory.reflect",
     ];
-    expected.sort();
 
     assert_eq!(
         names.len(),
@@ -225,7 +230,8 @@ fn knowledge_mcp_serves_seven_tools() {
         "wicked-knowledge-mcp",
     );
 
-    let mut expected = vec![
+    // Documented roster, in sorted order (matches `names`, which is sorted).
+    let expected = [
         "knowledge.coverage",
         "knowledge.ingest",
         "knowledge.recall",
@@ -234,7 +240,6 @@ fn knowledge_mcp_serves_seven_tools() {
         "knowledge.relate_code",
         "knowledge.write",
     ];
-    expected.sort();
 
     assert_eq!(
         names.len(),
