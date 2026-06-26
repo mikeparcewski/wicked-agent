@@ -67,6 +67,7 @@ fn real_claude_e2e_pineapple_deny() {
         "exec",
         &workdir,
         Duration::from_secs(120),
+        &[], // toolbox — augment-mode; empty for this deny-gate test (no MCP servers needed)
     )
     .expect("launch_wrapped");
 
