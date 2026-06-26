@@ -28,7 +28,7 @@ use wicked_apps_core::{
     Span, SqliteStore, ToNode, SYMBOL_SCHEME,
 };
 
-use wicked_governance::{conform, decide, select};
+use wicked_governance::{conform, decide, decide_as, select};
 use wicked_orchestration::{apply_event, apply_gate, get_phase, Event, Phase, PhaseStatus};
 
 use crate::inject::{launch_wrapped, LaunchOutcome, WrappedCli};
@@ -42,7 +42,7 @@ pub const WORK_OUTPUT: &str = "work_output";
 /// A fixed evaluation timestamp base for claims minted by the harness. Deterministic per unit
 /// (offset by `ord`) so the same session re-derives the same claim ids without a wall clock on the
 /// decision path. (Unix-seconds; the prototype used ISO, wicked-apps-core's claim field is `i64`.)
-const EVAL_AT_BASE: i64 = 1_750_000_000;
+pub const EVAL_AT_BASE: i64 = 1_750_000_000;
 
 /// The outcome of executing one unit — the harness records this back onto the unit node.
 #[derive(Debug, Clone, Serialize)]
@@ -72,6 +72,23 @@ pub struct UnitOutcome {
     /// REAL-CLI path only: did the per-tool-call gate BLOCK an action (the effect never landed)?
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gate_blocked: bool,
+    /// evaluator≠creator: the claim_id of the SECOND governance pass (different evaluator identity),
+    /// present only when the unit was approved AND an evaluator CLI was provided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluator_claim_id: Option<String>,
+}
+
+/// The outcome of the evaluator≠creator second-pass governance evaluation (ADR-0003 extension).
+#[derive(Debug, Clone, Serialize)]
+pub struct EvaluationOutcome {
+    /// The distinct evaluator identity stamped on the claim (e.g. `"wicked-evaluator:agy"`).
+    pub evaluator_identity: String,
+    /// The claim_id minted by the evaluator pass (different from the creator's claim_id).
+    pub claim_id: String,
+    /// The governance decision of the evaluator pass (`allow` / `deny` / `allow_with_conditions`).
+    pub decision: String,
+    /// Whether the evaluator pass approved (mirrors `decision == allow | allow_with_conditions`).
+    pub approved: bool,
 }
 
 /// Execute one unit on the shared `store`. See the module docs for the exact ordered flow.
@@ -170,6 +187,64 @@ pub fn execute_unit(
         cli_exit_code: None,
         artifact_path: None,
         gate_blocked: false,
+        evaluator_claim_id: None,
+    })
+}
+
+/// Run a SECOND governance pass on an approved unit using a DISTINCT evaluator identity
+/// (the evaluator≠creator invariant). The second claim is persisted via `conform`; its `claim_id`
+/// is different from the creator's because `evaluate_identity` is included in the seed.
+///
+/// Call ONLY after the creator pass approved (`outcome.approved == true`). Calling on a rejected
+/// unit is a caller bug — this function returns an error in that case so misuse surfaces early.
+///
+/// The evaluator context includes the real work `output` so the evaluator can assess the
+/// ACTUAL result (not just the description). The governance `phase` is `"eval-{phase_name}"` so
+/// policies can specifically target the evaluation phase.
+pub fn evaluate_unit(
+    store: &mut SqliteStore,
+    unit: &WorkUnit,
+    output: &str,
+    evaluator_cli: &str,
+    collection_scope: &str,
+    phase_name: &str,
+    evaluated_at: i64,
+) -> anyhow::Result<EvaluationOutcome> {
+    let evaluator_identity = format!("wicked-evaluator:{evaluator_cli}");
+    let eval_phase = format!("eval-{phase_name}");
+
+    let eval_context = serde_json::json!({
+        "phase": eval_phase,
+        "scope": collection_scope,
+        "unit_id": unit.id,
+        "description": unit.description,
+        "evaluator_cli": evaluator_cli,
+        "output": output,
+    });
+
+    let selected = select(store, collection_scope, &eval_phase, &eval_context)?;
+    let claim = decide_as(
+        &selected,
+        collection_scope,
+        &eval_phase,
+        &eval_context,
+        evaluated_at,
+        &evaluator_identity,
+    );
+    let decision = decision_token(&claim.decision).to_string();
+    let approved = matches!(
+        claim.decision,
+        Decision::Allow | Decision::AllowWithConditions
+    );
+    let claim_id = claim.claim_id.clone();
+
+    conform(store, &claim)?;
+
+    Ok(EvaluationOutcome {
+        evaluator_identity,
+        claim_id,
+        decision,
+        approved,
     })
 }
 
@@ -316,6 +391,7 @@ pub fn execute_unit_wrapped(
         cli_exit_code,
         artifact_path,
         gate_blocked,
+        evaluator_claim_id: None,
     })
 }
 

@@ -23,7 +23,7 @@ use std::time::Duration;
 use wicked_council::dispatch::RealDispatcher;
 use wicked_council::{
     ids, work_kind_for, AgenticCli, CouncilTask, EstateHandle, EstateRankStore, Ledger,
-    NoopEventSink, PollStatus, TaskState, Worker,
+    NoopEventSink, PollStatus, RankStore, TaskState, Worker,
 };
 
 use crate::WorkUnit;
@@ -44,6 +44,11 @@ pub struct Distribution {
 /// The criteria the council weighs when distributing a unit. A single coarse bucket — the harness
 /// does not invent a taxonomy the caller didn't provide (mirrors the prototype's `["general"]`).
 const DISTRIBUTE_CRITERIA: &[&str] = &["general"];
+
+/// Minimum number of historical observations before the ranked fast path fires.
+const MIN_RANKED_OBS: u32 = 5;
+/// Minimum composite score (0.5·success + 0.5·agreement) for the ranked fast path to fire.
+const RANKED_SCORE_THRESHOLD: f32 = 0.80;
 
 /// Convene the council (in-process) for every unit and return one [`Distribution`] each.
 ///
@@ -99,13 +104,29 @@ fn distribute_one(
     };
     let ledger = Ledger::new(estate.clone());
     let rank_store = Arc::new(EstateRankStore::new(estate));
+
+    // RANKED FAST PATH — if historical evidence meets both the observation floor AND the score
+    // threshold, assign directly without convening the council. The governance gate STILL fires
+    // in execute_unit: ranking bypasses distribution, NOT governance (ADR-0003 invariant).
+    let criteria: Vec<String> = DISTRIBUTE_CRITERIA.iter().map(|s| s.to_string()).collect();
+    let work_kind = work_kind_for(&criteria);
+    if let Some(best) = rank_store.best_for(&work_kind, 1).into_iter().next() {
+        if best.n >= MIN_RANKED_OBS
+            && best.score >= RANKED_SCORE_THRESHOLD
+            && roster_keys.contains(&best.cli)
+        {
+            return Ok(Distribution {
+                unit_id: unit.id.clone(),
+                assigned_cli: best.cli,
+                council_task_ref: None,
+                degraded: false,
+            });
+        }
+    }
     let dispatcher = Arc::new(RealDispatcher {
         timeout: Duration::from_secs(30),
         local_runner_timeout: Duration::from_secs(30),
     });
-    let criteria: Vec<String> = DISTRIBUTE_CRITERIA.iter().map(|s| s.to_string()).collect();
-    let work_kind = work_kind_for(&criteria);
-
     let worker = Worker::new(
         ledger,
         dispatcher,

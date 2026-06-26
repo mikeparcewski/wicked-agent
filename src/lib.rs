@@ -51,7 +51,8 @@ pub mod scope;
 
 pub use distribute::{distribute_units, distribute_units_on, Distribution};
 pub use execute::{
-    execute_unit, execute_unit_wrapped, UnitOutcome, DEFAULT_CLI_TIMEOUT, WORK_OUTPUT,
+    evaluate_unit, execute_unit, execute_unit_wrapped, EvaluationOutcome, UnitOutcome,
+    DEFAULT_CLI_TIMEOUT, WORK_OUTPUT,
 };
 pub use inject::{
     launch_wrapped, parse_decisions_file, run_gate_hook, GovernanceMode, LaunchOutcome, WrappedCli,
@@ -383,6 +384,19 @@ pub fn run_session(
         }),
     ));
 
+    // Register the workflow node AFTER planning so the cursor can be ticked per unit in execute.
+    // execute_unit manages each phase's lifecycle itself; register_workflow only persists the ordered
+    // phase list + cursor so the workflow is queryable without opening any phases.
+    let phase_specs: Vec<(String, String)> = units
+        .iter()
+        .map(|u| {
+            let phase_name = format!("unit-{}", u.ord);
+            let phase_id = format!("{workflow_id}:{phase_name}");
+            (phase_id, u.description.clone())
+        })
+        .collect();
+    wicked_orchestration::register_workflow(store, &workflow_id, problem, &phase_specs)?;
+
     // ── 2. DISTRIBUTE — the council (in-process) picks the assigned CLI per unit. ──
     let distributions = distribute::distribute_units(&units, &clis, &session_id)?;
     for (u, dist) in units.iter_mut().zip(distributions.iter()) {
@@ -410,7 +424,29 @@ pub fn run_session(
 
     let mut outcomes: Vec<UnitOutcome> = Vec::with_capacity(units.len());
     for u in &mut units {
-        let outcome = execute::execute_unit(store, u, &workflow_id, entity_mode, &session_id)?;
+        let mut outcome = execute::execute_unit(store, u, &workflow_id, entity_mode, &session_id)?;
+
+        // evaluator≠creator: run a second governance pass on approved units using a different CLI
+        // as the evaluator identity. Pick the NEXT CLI in the roster (or any other if only one seat).
+        if outcome.approved {
+            let evaluator_cli = next_cli_in_roster(&outcome.assigned_cli, &cli_keys);
+            let eval_at = execute::EVAL_AT_BASE + u.ord as i64 + 1_000_000;
+            if let Ok(eval) = execute::evaluate_unit(
+                store,
+                u,
+                &format!("stub-output for {}", u.description),
+                &evaluator_cli,
+                &outcome.collection_scope,
+                &format!("unit-{}", u.ord),
+                eval_at,
+            ) {
+                outcome.evaluator_claim_id = Some(eval.claim_id);
+            }
+        }
+
+        // Tick the workflow cursor AFTER the unit completes (does not open the next phase —
+        // execute_unit manages that in the next loop iteration).
+        wicked_orchestration::tick_workflow(store, &workflow_id, outcome.approved)?;
 
         // Record the unit's outcome back onto its shared-store node.
         u.phase_ref = Some(outcome.phase_id.clone());
@@ -540,6 +576,17 @@ pub fn run_session_wrapped(
         serde_json::json!({ "session_id": session_id, "unit_count": units.len() }),
     ));
 
+    // Register workflow node for the wrapped session (same as stub path).
+    let phase_specs_w: Vec<(String, String)> = units
+        .iter()
+        .map(|u| {
+            let phase_name = format!("unit-{}", u.ord);
+            let phase_id = format!("{workflow_id}:{phase_name}");
+            (phase_id, u.description.clone())
+        })
+        .collect();
+    wicked_orchestration::register_workflow(store, &workflow_id, problem, &phase_specs_w)?;
+
     // ── 2. DISTRIBUTE — the council (in-process, REAL verdict) picks the assigned CLI per unit. ──
     // The council shares the SAME on-disk file (its task/verdict land alongside the agent's entities,
     // R6) — resolved from WICKED_ESTATE_DB, which the caller exports for the gate-hook child too. The
@@ -574,7 +621,7 @@ pub fn run_session_wrapped(
             .unwrap_or_else(|| "claude".to_string());
         let wrapped = wrapped_cli_for(&assigned, &clis, governance_mode);
         let workdir = sandbox_root.join(&session_id).join(&u.id);
-        let outcome = execute::execute_unit_wrapped(
+        let mut outcome = execute::execute_unit_wrapped(
             store,
             u,
             &wrapped,
@@ -584,6 +631,29 @@ pub fn run_session_wrapped(
             &workdir,
             timeout,
         )?;
+
+        // evaluator≠creator: second governance pass on approved units.
+        if outcome.approved {
+            let evaluator_cli = next_cli_in_roster(&outcome.assigned_cli, &cli_keys);
+            let eval_at = execute::EVAL_AT_BASE + u.ord as i64 + 1_000_000;
+            if let Ok(eval) = execute::evaluate_unit(
+                store,
+                u,
+                &outcome
+                    .artifact_path
+                    .clone()
+                    .unwrap_or_else(|| format!("stub-output for {}", u.description)),
+                &evaluator_cli,
+                &outcome.collection_scope,
+                &format!("unit-{}", u.ord),
+                eval_at,
+            ) {
+                outcome.evaluator_claim_id = Some(eval.claim_id);
+            }
+        }
+
+        // Tick the workflow cursor.
+        wicked_orchestration::tick_workflow(store, &workflow_id, outcome.approved)?;
 
         u.phase_ref = Some(outcome.phase_id.clone());
         u.conformance_ref = outcome.claim_id.clone();
@@ -693,10 +763,366 @@ fn tokenize_invocation(s: &str) -> Vec<String> {
     out
 }
 
+/// Pick an evaluator CLI that is DIFFERENT from `creator`. Returns the next key in the roster, or
+/// the first if creator is last, or `"wicked-evaluator"` as a synthetic fallback when the roster
+/// has only one seat. The caller uses the returned key to stamp the evaluator_identity.
+fn next_cli_in_roster(creator: &str, roster: &[String]) -> String {
+    let pos = roster.iter().position(|k| k == creator);
+    match pos {
+        Some(i) => roster
+            .get(i + 1)
+            .or_else(|| roster.first())
+            .filter(|k| k.as_str() != creator) // don't loop back to the same when only 1 seat
+            .cloned()
+            .unwrap_or_else(|| "wicked-evaluator".to_string()),
+        None => roster
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "wicked-evaluator".to_string()),
+    }
+}
+
 /// A deterministic short id from parts (sha256 prefix; matches the estate's dependency-free style).
 pub(crate) fn deterministic_id(parts: &[&str]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(parts.join("|").as_bytes());
     format!("{:x}", hasher.finalize())[..16].to_string()
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use wicked_apps_core::SqliteStore;
+    use wicked_council::types::{
+        AgenticCli, Category, Confidence, InputMode, RankSignal, RankStore,
+    };
+    use wicked_council::{EstateHandle, EstateRankStore};
+    use wicked_governance::{
+        claim_from_node, claim_symbol, Effect, Policy, Severity, Trigger, EVALUATOR_IDENTITY,
+    };
+    use wicked_orchestration::{get_workflow, WorkflowStatus};
+
+    use super::*;
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn unique_tempdir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("wa-test-{tag}-{pid}-{n}"));
+        std::fs::create_dir_all(&dir).expect("create tempdir");
+        dir
+    }
+
+    fn write_fake_cli(dir: &std::path::Path, name: &str, recommendation: &str) -> String {
+        let path = dir.join(name);
+        let script = format!(
+            "#!/bin/sh\n\
+             echo \"RECOMMENDATION: {recommendation}\"\n\
+             echo \"TOP_RISK: none\"\n\
+             echo \"CHANGE_MY_MIND: no\"\n\
+             echo \"DISQUALIFIER: None\"\n"
+        );
+        std::fs::write(&path, &script).expect("write fake cli");
+        let mut perms = std::fs::metadata(&path).expect("stat").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+        path.display().to_string()
+    }
+
+    fn fake_cli_record(key: &str, script_path: &str) -> AgenticCli {
+        AgenticCli {
+            key: key.to_string(),
+            display_name: format!("Fake {key}"),
+            binary: script_path.to_string(),
+            headless_invocation: format!("{script_path} \"{{PROMPT}}\""),
+            category: Category::AgenticCoder,
+            input_mode: InputMode::PromptArg,
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::Verified,
+            enabled_for_council: true,
+        }
+    }
+
+    fn two_fake_clis(dir: &std::path::Path) -> Vec<AgenticCli> {
+        let a = write_fake_cli(dir, "fake-a.sh", "fake-a");
+        let b = write_fake_cli(dir, "fake-b.sh", "fake-b");
+        vec![fake_cli_record("fake-a", &a), fake_cli_record("fake-b", &b)]
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    /// After a complete run, the Workflow node must have cursor == unit_count and status == Complete.
+    #[test]
+    fn run_session_workflow_cursor_reaches_complete() {
+        let dir = unique_tempdir("wf-cursor");
+        let clis = two_fake_clis(&dir);
+
+        let mut store = SqliteStore::in_memory().expect("open store");
+        let result = run_session(
+            &mut store,
+            clis,
+            "design\nimplement",
+            EntityMode::Shared,
+            Some("sess-wf-cursor"),
+        )
+        .expect("run_session");
+
+        let wf = get_workflow(&store, &result.workflow_id)
+            .expect("read workflow")
+            .expect("workflow must exist");
+
+        assert_eq!(
+            wf.status,
+            WorkflowStatus::Complete,
+            "all units approved → workflow must be Complete"
+        );
+        assert_eq!(
+            wf.current_index,
+            result.units.len(),
+            "cursor must have advanced past every unit"
+        );
+    }
+
+    /// Approved units must carry a distinct evaluator_claim_id (evaluator≠creator invariant).
+    #[test]
+    fn approved_unit_has_evaluator_claim_distinct_from_creator() {
+        let dir = unique_tempdir("eval-claim");
+        let clis = two_fake_clis(&dir);
+
+        let mut store = SqliteStore::in_memory().expect("open store");
+        let result = run_session(
+            &mut store,
+            clis,
+            "single task",
+            EntityMode::Shared,
+            Some("sess-eval-claim"),
+        )
+        .expect("run_session");
+
+        // All units in this no-policy session should be approved.
+        for outcome in &result.units {
+            assert!(
+                outcome.approved,
+                "unit {} should be approved",
+                outcome.unit_id
+            );
+            assert!(
+                outcome.evaluator_claim_id.is_some(),
+                "approved unit {} must have an evaluator_claim_id",
+                outcome.unit_id
+            );
+            assert_ne!(
+                outcome.evaluator_claim_id.as_deref(),
+                outcome.claim_id.as_deref(),
+                "evaluator_claim_id must differ from the creator claim_id (different seed)"
+            );
+        }
+    }
+
+    /// The creator claim must bear the canonical EVALUATOR_IDENTITY; the evaluator claim must
+    /// bear a "wicked-evaluator:…" identity — these are the two halves of the evaluator≠creator proof.
+    #[test]
+    fn evaluator_identity_is_distinct_from_creator_identity() {
+        let dir = unique_tempdir("eval-id");
+        let clis = two_fake_clis(&dir);
+
+        let mut store = SqliteStore::in_memory().expect("open store");
+        let result = run_session(
+            &mut store,
+            clis,
+            "single unit",
+            EntityMode::Shared,
+            Some("sess-eval-id"),
+        )
+        .expect("run_session");
+
+        let outcome = result.units.first().expect("at least one unit");
+        assert!(outcome.approved);
+
+        // Read both claims from the store and check their evaluator_identity fields.
+        let creator_claim_id = outcome.claim_id.as_deref().expect("creator claim_id");
+        let evaluator_claim_id = outcome
+            .evaluator_claim_id
+            .as_deref()
+            .expect("evaluator claim_id");
+
+        let creator_node = store
+            .get_node(&claim_symbol(creator_claim_id))
+            .expect("store ok")
+            .expect("creator claim node must exist");
+        let creator_claim = claim_from_node(&creator_node).expect("parse creator");
+
+        let evaluator_node = store
+            .get_node(&claim_symbol(evaluator_claim_id))
+            .expect("store ok")
+            .expect("evaluator claim node must exist");
+        let evaluator_claim = claim_from_node(&evaluator_node).expect("parse evaluator");
+
+        assert_eq!(
+            creator_claim.evaluator_identity, EVALUATOR_IDENTITY,
+            "creator pass must bear the canonical EVALUATOR_IDENTITY"
+        );
+        assert!(
+            evaluator_claim
+                .evaluator_identity
+                .starts_with("wicked-evaluator:"),
+            "evaluator pass must bear a wicked-evaluator:… identity, got {:?}",
+            evaluator_claim.evaluator_identity
+        );
+        assert_ne!(
+            creator_claim.evaluator_identity, evaluator_claim.evaluator_identity,
+            "creator and evaluator identities must differ"
+        );
+    }
+
+    /// Rejected units must NOT get an evaluator claim (evaluation only runs on approval).
+    #[test]
+    fn rejected_unit_has_no_evaluator_claim() {
+        let dir = unique_tempdir("reject-eval");
+        let clis = two_fake_clis(&dir);
+
+        let mut store = SqliteStore::in_memory().expect("open store");
+
+        // Deny policy targeting the first unit's phase ("unit-1" for a single-piece problem).
+        let deny_policy = Policy {
+            id: "deny-all-test".to_string(),
+            kind: "policy".to_string(),
+            applies_to: vec!["unit-1".to_string()],
+            effect: Effect::Deny,
+            trigger: Trigger { contains: None },
+            obligations: vec![],
+            criteria: "deny unit-1".to_string(),
+            severity: Severity::High,
+            rule: "test deny".to_string(),
+        };
+        wicked_governance::register_policy(&mut store, &deny_policy).expect("register deny policy");
+
+        let result = run_session(
+            &mut store,
+            clis,
+            "some task",
+            EntityMode::Shared,
+            Some("sess-reject-eval"),
+        )
+        .expect("run_session");
+
+        for outcome in &result.units {
+            assert!(!outcome.approved, "deny policy must reject the unit");
+            assert!(
+                outcome.evaluator_claim_id.is_none(),
+                "rejected unit must NOT have an evaluator_claim_id"
+            );
+        }
+    }
+
+    /// Rejection ticks the workflow to Failed — the cursor stops at the rejected phase.
+    #[test]
+    fn rejected_session_workflow_is_failed() {
+        let dir = unique_tempdir("wf-fail");
+        let clis = two_fake_clis(&dir);
+
+        let mut store = SqliteStore::in_memory().expect("open store");
+
+        let deny_policy = Policy {
+            id: "deny-all-fail".to_string(),
+            kind: "policy".to_string(),
+            applies_to: vec!["unit-1".to_string()],
+            effect: Effect::Deny,
+            trigger: Trigger { contains: None },
+            obligations: vec![],
+            criteria: "deny unit-1".to_string(),
+            severity: Severity::High,
+            rule: "test deny".to_string(),
+        };
+        wicked_governance::register_policy(&mut store, &deny_policy).expect("register policy");
+
+        let result = run_session(
+            &mut store,
+            clis,
+            "fail this",
+            EntityMode::Shared,
+            Some("sess-wf-fail"),
+        )
+        .expect("run_session");
+
+        let wf = get_workflow(&store, &result.workflow_id)
+            .expect("read workflow")
+            .expect("workflow must exist");
+
+        assert_eq!(
+            wf.status,
+            WorkflowStatus::Failed,
+            "a denied unit must set the workflow to Failed"
+        );
+        // tick_workflow does NOT advance the cursor on rejection — it stays at 0.
+        assert_eq!(wf.current_index, 0, "cursor is not advanced on rejection");
+    }
+
+    /// Adversarial: the ranked fast path bypasses the COUNCIL but the GOVERNANCE GATE still fires.
+    /// Seed sufficient historical observations for fake-a → distribute must fast-path (no
+    /// council_task_ref) → execute must still produce a claim (gate is not bypassed).
+    #[test]
+    fn ranked_fast_path_bypasses_council_but_not_governance_gate() {
+        let dir = unique_tempdir("ranked");
+        let clis = two_fake_clis(&dir);
+        let db_path = dir.join("ranked.db");
+        let db_str = db_path.display().to_string();
+
+        // Seed 6 observations for "fake-a" on the shared store so the fast path fires.
+        {
+            let estate = EstateHandle::new(SqliteStore::open(&db_str).expect("open ranked db"));
+            let rank_store = EstateRankStore::new(estate);
+            let work_kind = wicked_council::work_kind_for(&["general".to_string()]);
+            for _ in 0..6 {
+                rank_store.record(
+                    "fake-a",
+                    &work_kind,
+                    &RankSignal {
+                        success: true,
+                        agreement_with_consensus: true,
+                        latency_ms: 100,
+                    },
+                );
+            }
+        }
+
+        // Distribute: with 6 observations at score 1.0 the fast path fires → no council_task_ref.
+        let units = plan::plan_units("ranked task", "sess-ranked");
+        let dists = distribute::distribute_units_on(&units, &clis, "sess-ranked", Some(&db_str))
+            .expect("distribute");
+        assert!(
+            dists.iter().all(|d| d.council_task_ref.is_none()),
+            "ranked fast path must fire: no council_task_ref when score ≥ 0.80 with ≥ 5 obs"
+        );
+        assert!(
+            dists.iter().all(|d| d.assigned_cli == "fake-a"),
+            "fast path must assign the ranked winner (fake-a)"
+        );
+
+        // Execute: the governance gate STILL fires even though distribution skipped the council.
+        let mut exec_store = SqliteStore::in_memory().expect("open exec store");
+        let mut unit = units.into_iter().next().expect("at least one unit");
+        unit.assigned_cli = Some("fake-a".to_string());
+        let outcome = execute::execute_unit(
+            &mut exec_store,
+            &unit,
+            "wf-sess-ranked",
+            EntityMode::Shared,
+            "sess-ranked",
+        )
+        .expect("execute_unit");
+
+        assert!(
+            outcome.claim_id.is_some(),
+            "governance gate must fire even on ranked-fast-path distribution"
+        );
+    }
 }

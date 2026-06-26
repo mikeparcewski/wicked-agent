@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -1556,9 +1556,9 @@ dependencies = [
 
 [[package]]
 name = "wicked-apps-core"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "838e2ad60bb2894bf0e03c17e77c9d3293d8a2b1efcb207c4f1051e1f5e307e4"
+checksum = "cca2e517379f632cbf9bb6c10e076e123a2fc17a9430ce2f6097db0077139bc2"
 dependencies = [
  "anyhow",
  "serde",
@@ -1570,9 +1570,9 @@ dependencies = [
 
 [[package]]
 name = "wicked-council"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc26d2e6df2d5382a54d330732ccba68e6b365bb083186e7f6e5dde858bad0c1"
+checksum = "d4c3a0fd0a9a411b160d9a057bdff938bfbf19aebf9e7a49c0b701719c794474"
 dependencies = [
  "anyhow",
  "serde",
@@ -1624,9 +1624,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-governance"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02b9b272b2426a14124c7f50b9a5fa3abe92abbc0c4f3163a389f2a936fdbe33"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "regex",
@@ -1641,9 +1639,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-orchestration"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66e527079dd82bac89ec7337e87abfc02544ae085e404f08469c6807d90f9fb4"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",
