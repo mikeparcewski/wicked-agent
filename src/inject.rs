@@ -544,5 +544,4 @@ mod tests {
         assert_eq!(ctx["command"], "echo hi");
         assert_eq!(ctx["work"], "echo hi");
     }
-
 }
