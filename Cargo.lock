@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -1624,7 +1624,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-governance"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "regex",
@@ -1639,7 +1639,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-orchestration"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde",

@@ -1,6 +1,6 @@
 [package]
 name = "wicked-agent"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 readme = "README.md"
@@ -20,8 +20,8 @@ path = "src/main.rs"
 [dependencies]
 wicked-apps-core = "0.2.0"
 # Drives the three siblings in-process (path deps while local changes are unpublished).
-wicked-governance = { path = "../wicked-governance" }
-wicked-orchestration = { path = "../wicked-orchestration" }
+wicked-governance = "0.3.0"
+wicked-orchestration = "0.3.0"
 wicked-council = "0.2.0"
 wicked-estate-core = "0.12.0"
 serde = { version = "1", features = ["derive"] }
