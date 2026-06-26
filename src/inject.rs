@@ -602,6 +602,15 @@ fn decision_str(decision: &Decision) -> &'static str {
     }
 }
 
+/// Crate-wide test-only lock serializing EVERY test (in ANY module of this lib's test binary) that
+/// mutates the process-global env vars `resolve_mcp_binary` reads (`WICKED_*_MCP_BIN`, `PATH`,
+/// `CARGO_HOME`, `HOME`, `USERPROFILE`). The lib's unit tests all run in ONE process with parallel
+/// threads, so `inject::tests` and `execute::tests` would otherwise race on these shared vars.
+/// Lock this for the WHOLE critical section (mutate → call → assert → restore). cfg(test) only —
+/// it does not exist in a production build.
+#[cfg(test)]
+pub(crate) static MCP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1039,15 +1048,13 @@ mod tests {
     // Rust runs tests in PARALLEL, so naive env mutation races. WORSE: this machine may HAVE the
     // three real servers installed in `~/.cargo/bin`, so the cargo-home fallback would resolve a
     // binary regardless of the env-override — a naive "missing → omitted" assertion is NOT
-    // deterministic. Each test below LOCKS `ENV_LOCK` (serializing all env-mutating tests against
-    // each other) and uses `EnvGuard` to SAVE every env var it touches, SET controlled values, and
-    // RESTORE on Drop (so even a panicking assertion cannot leak mutation). To prove "missing →
-    // omitted" we must neutralize ALL THREE resolution layers: env-override → nonexistent path,
-    // PATH → an empty temp dir, and the cargo-home fallback → CARGO_HOME/HOME/USERPROFILE all
-    // pointed at an empty temp dir with no `.cargo/bin/<binary>`.
-
-    /// Serializes every test that mutates process-global env. ALL env-touching tests must lock this.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // deterministic. Each test below LOCKS `MCP_ENV_LOCK` (the crate-wide lock, shared with
+    // `execute::tests`, serializing all env-mutating tests against each other) and uses `EnvGuard`
+    // to SAVE every env var it touches, SET controlled values, and RESTORE on Drop (so even a
+    // panicking assertion cannot leak mutation). To prove "missing → omitted" we must neutralize
+    // ALL THREE resolution layers: env-override → nonexistent path, PATH → an empty temp dir, and
+    // the cargo-home fallback → CARGO_HOME/HOME/USERPROFILE all pointed at an empty temp dir with
+    // no `.cargo/bin/<binary>`.
 
     /// Save/restore guard for a set of env vars. On construction it records the current value (or
     /// absence) of each named var; on Drop it restores them exactly — present vars are re-set to
@@ -1129,7 +1136,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn discover_toolbox_env_override_includes_server_with_exact_path() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = MCP_ENV_LOCK.lock().unwrap();
         let guard = EnvGuard::capture(RESOLVER_ENV);
 
         // Neutralize the lower layers so the ONLY thing that can resolve estate is our override.
@@ -1176,7 +1183,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn discover_toolbox_all_missing_returns_empty_and_no_config() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = MCP_ENV_LOCK.lock().unwrap();
         let guard = EnvGuard::capture(RESOLVER_ENV);
 
         let empty = neutralize_path_and_cargo_home(&guard, "missing");
@@ -1213,7 +1220,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn discover_toolbox_partial_toolbox_includes_only_resolvable() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = MCP_ENV_LOCK.lock().unwrap();
         let guard = EnvGuard::capture(RESOLVER_ENV);
 
         let empty = neutralize_path_and_cargo_home(&guard, "partial");
@@ -1259,7 +1266,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resolve_mcp_binary_nonexistent_override_falls_through_to_none() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = MCP_ENV_LOCK.lock().unwrap();
         let guard = EnvGuard::capture(RESOLVER_ENV);
 
         let empty = neutralize_path_and_cargo_home(&guard, "fallthrough");
@@ -1281,7 +1288,7 @@ mod tests {
     #[test]
     fn resolve_mcp_binary_finds_binary_on_path() {
         use std::os::unix::fs::PermissionsExt;
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = MCP_ENV_LOCK.lock().unwrap();
         let guard = EnvGuard::capture(RESOLVER_ENV);
 
         let empty = neutralize_path_and_cargo_home(&guard, "pathprobe");
@@ -1313,7 +1320,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resolve_mcp_binary_finds_binary_in_cargo_home() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = MCP_ENV_LOCK.lock().unwrap();
         let guard = EnvGuard::capture(RESOLVER_ENV);
 
         let empty = neutralize_path_and_cargo_home(&guard, "cargohome");
