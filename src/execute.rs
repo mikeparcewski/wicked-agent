@@ -314,6 +314,7 @@ pub fn execute_unit_wrapped(
     // ── 3. LAUNCH the real subprocess — ONLY if the unit-level gate allows. ──
     // On a unit-level Deny the CLI is NEVER launched (no subprocess, no output). On Allow the CLI
     // runs and its OWN per-tool-call pre-hook gates each action across the process boundary.
+    let toolbox = crate::inject::discover_toolbox();
     let launch: Option<LaunchOutcome> = if unit_denied {
         None
     } else {
@@ -324,6 +325,7 @@ pub fn execute_unit_wrapped(
             &phase_name,
             workdir,
             timeout,
+            &toolbox,
         )?)
     };
 

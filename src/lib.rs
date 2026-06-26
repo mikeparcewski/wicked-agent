@@ -55,7 +55,8 @@ pub use execute::{
     DEFAULT_CLI_TIMEOUT, WORK_OUTPUT,
 };
 pub use inject::{
-    launch_wrapped, parse_decisions_file, run_gate_hook, GovernanceMode, LaunchOutcome, WrappedCli,
+    discover_toolbox, launch_wrapped, parse_decisions_file, run_gate_hook, write_mcp_config,
+    GovernanceMode, LaunchOutcome, McpServerSpec, WrappedCli,
 };
 pub use plan::plan_units;
 pub use scope::{resolve_scope, EntityMode};

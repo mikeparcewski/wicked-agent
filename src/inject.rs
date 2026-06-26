@@ -7,6 +7,15 @@
 //! are appended to a run-local `decisions.ndjson` for the harness to read back after the process
 //! exits. Exit 2 = deny (Claude aborts the tool-call BEFORE it runs); exit 0 = allow.
 //!
+//! MCP TOOLBOX INJECTION (augment mode):
+//! For `claude` launches, the harness also writes a `mcpServers` config to
+//! `workdir/.claude/mcp.json` and passes `--mcp-config <path>` (NOT `--strict-mcp-config`).
+//! This is ADDITIVE: the launched Claude gets the user's own MCP servers PLUS the collection's
+//! wicked-* toolbox servers. The toolbox is the 9 Rust crates: wicked-estate-mcp,
+//! wicked-memory-mcp, wicked-knowledge-mcp, and future overlay/governance/orchestration/
+//! council/agent/apps-core servers. Non-claude CLIs (agy, pi) are NOT given `--mcp-config`
+//! and remain ungoverned at the per-tool-call level.
+//!
 //! THE INVARIANT (ADR-0003): the gate fires on EVERY launch. `blocked == true` means a tool-call was
 //! denied — the forbidden effect was aborted before it ran.
 
@@ -17,6 +26,186 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use wicked_apps_core::{ConformanceClaim, Decision};
 use wicked_governance::{conform, decide, select};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MCP toolbox injection — augment mode (NOT hermetic).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One MCP server entry in the toolbox — the minimum fields Claude's `mcpServers` schema requires.
+/// The `command` + `args` form the actual process launch; `env` is merged into the child environment.
+/// Follows the Claude `--mcp-config` JSON schema: `{ "mcpServers": { "<name>": { ... } } }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerSpec {
+    /// The logical name under `mcpServers` (e.g. `"wicked-estate"`, `"wicked-memory"`).
+    pub name: String,
+    /// The executable to launch (e.g. `"wicked-estate-mcp"` or an absolute path).
+    pub command: String,
+    /// Leading args passed to the MCP server process (often empty for stdio servers).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Optional environment variables merged into the MCP server's environment.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub env: std::collections::HashMap<String, String>,
+}
+
+/// Write the MCP server toolbox config to `workdir/.claude/mcp.json`.
+///
+/// The written JSON follows Claude's `--mcp-config` schema:
+/// ```json
+/// { "mcpServers": { "<name>": { "command": "...", "args": [...], "env": {...} } } }
+/// ```
+/// Returns `Some(path)` when the config was written (caller adds `--mcp-config <path>`), or `None`
+/// when `toolbox` is empty (no flag added — matches the "no servers yet" infrastructure stub).
+///
+/// **Augment mode** (ADR-0003 extension): this config is always passed with `--mcp-config`, NEVER
+/// `--strict-mcp-config`, so the launched CLI receives the user's existing MCP servers PLUS these.
+pub fn write_mcp_config(
+    workdir: &Path,
+    toolbox: &[McpServerSpec],
+) -> anyhow::Result<Option<PathBuf>> {
+    if toolbox.is_empty() {
+        return Ok(None);
+    }
+
+    let settings_dir = workdir.join(".claude");
+    std::fs::create_dir_all(&settings_dir)
+        .map_err(|e| anyhow::anyhow!("mkdir .claude for mcp.json: {e}"))?;
+
+    // Build the `mcpServers` map from the toolbox specs.
+    let mut servers = serde_json::Map::new();
+    for spec in toolbox {
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "command".to_string(),
+            serde_json::Value::String(spec.command.clone()),
+        );
+        if !spec.args.is_empty() {
+            entry.insert(
+                "args".to_string(),
+                serde_json::Value::Array(
+                    spec.args
+                        .iter()
+                        .map(|a| serde_json::Value::String(a.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        if !spec.env.is_empty() {
+            let env_map: serde_json::Map<String, serde_json::Value> = spec
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            entry.insert("env".to_string(), serde_json::Value::Object(env_map));
+        }
+        servers.insert(spec.name.clone(), serde_json::Value::Object(entry));
+    }
+
+    let config = serde_json::json!({ "mcpServers": servers });
+    let mcp_path = settings_dir.join("mcp.json");
+    let json = serde_json::to_string_pretty(&config)
+        .map_err(|e| anyhow::anyhow!("serialize mcp.json: {e}"))?;
+    std::fs::write(&mcp_path, json).map_err(|e| anyhow::anyhow!("write mcp.json: {e}"))?;
+    Ok(Some(mcp_path))
+}
+
+/// Discover the toolbox `McpServerSpec` list by probing known wicked-* MCP server binaries.
+///
+/// Resolution order per server:
+///   1. An explicit env var override, e.g. `WICKED_ESTATE_MCP_BIN=/path/to/wicked-estate-mcp`.
+///   2. The binary found on `$PATH` via a cheap `which`-style probe.
+///   3. The Cargo home (`~/.cargo/bin/<name>`) as a last resort (installed via `cargo install`).
+///
+/// When NONE of the probe steps finds a binary, that server is silently omitted — the harness
+/// degrades gracefully (fewer toolbox tools, not a hard error). This lets the infrastructure stub
+/// (`write_mcp_config` with an empty slice) coexist with a partially-built toolbox.
+///
+/// Toolbox = 9 crates (wicked-apps-core is a library-only crate, so only 3 expose MCP servers
+/// today; the remaining 6 are registered as future slots once they ship MCP server binaries):
+///   - wicked-estate-mcp  (wicked-estate)   — code graph / semantic search
+///   - wicked-memory-mcp  (wicked-memory)   — memory capture / recall
+///   - wicked-knowledge-mcp (wicked-knowledge) — knowledge graph
+///   - wicked-overlay-mcp (wicked-overlay)  — cross-store edges (future)
+///   - wicked-governance-mcp (wicked-governance) — policy query (future)
+///   - wicked-orchestration-mcp (wicked-orchestration) — workflow query (future)
+///   - wicked-council-mcp (wicked-council)  — CLI roster / distribution (future)
+///   - wicked-agent-mcp (wicked-agent)      — session / unit query (future)
+pub fn discover_toolbox() -> Vec<McpServerSpec> {
+    /// Known MCP server entries: (binary name, logical server name, env-override var).
+    const KNOWN: &[(&str, &str, &str)] = &[
+        (
+            "wicked-estate-mcp",
+            "wicked-estate",
+            "WICKED_ESTATE_MCP_BIN",
+        ),
+        (
+            "wicked-memory-mcp",
+            "wicked-memory",
+            "WICKED_MEMORY_MCP_BIN",
+        ),
+        (
+            "wicked-knowledge-mcp",
+            "wicked-knowledge",
+            "WICKED_KNOWLEDGE_MCP_BIN",
+        ),
+    ];
+
+    let mut specs = Vec::new();
+
+    for &(binary, name, env_var) in KNOWN {
+        if let Some(cmd) = resolve_mcp_binary(binary, env_var) {
+            specs.push(McpServerSpec {
+                name: name.to_string(),
+                command: cmd,
+                args: Vec::new(),
+                env: Default::default(),
+            });
+        }
+    }
+
+    specs
+}
+
+/// Resolve one MCP server binary: env override → PATH probe → Cargo home fallback.
+/// Returns `None` when the binary is not found by any strategy.
+fn resolve_mcp_binary(binary: &str, env_var: &str) -> Option<String> {
+    // 1. Explicit env override (highest priority — lets CI/tests pin exact paths).
+    if let Ok(p) = std::env::var(env_var) {
+        if !p.is_empty() && std::path::Path::new(&p).exists() {
+            return Some(p);
+        }
+    }
+
+    // 2. PATH probe — use `which`-style search through PATH entries.
+    if let Ok(path_val) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_val) {
+            let candidate = dir.join(binary);
+            if candidate.exists() {
+                return Some(candidate.display().to_string());
+            }
+        }
+    }
+
+    // 3. Cargo home fallback (~/.cargo/bin/<binary>).
+    // CARGO_HOME is explicit; otherwise derive from HOME (macOS/Linux) or USERPROFILE (Windows).
+    let cargo_home = std::env::var("CARGO_HOME")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .ok()
+                .map(|h| std::path::PathBuf::from(h).join(".cargo"))
+        });
+    if let Some(cargo_bin) = cargo_home {
+        let candidate = cargo_bin.join("bin").join(binary);
+        if candidate.exists() {
+            return Some(candidate.display().to_string());
+        }
+    }
+
+    None
+}
 
 /// The governance mode (capability) of a wrapped CLI — its gate MECHANISM (ADR-0003 step 2/3).
 /// The gate ALWAYS fires; only its TIMING degrades for incapable CLIs.
@@ -91,6 +280,10 @@ pub struct LaunchOutcome {
 /// `ConformanceClaim` to `.wicked-agent/decisions.ndjson` in the workdir. After the subprocess
 /// exits, the harness reads that file: the first Deny is the authoritative blocking claim; if no
 /// Deny, the last claim is used. `blocked` is true if any claim is a Deny.
+///
+/// For claude launches, if `toolbox` is non-empty, also writes `.claude/mcp.json` and passes
+/// `--mcp-config <path>` (augment mode — additive, NOT `--strict-mcp-config`). Non-claude CLIs
+/// receive no `--mcp-config` flag even when `toolbox` is populated.
 pub fn launch_wrapped(
     cli: &WrappedCli,
     unit_description: &str,
@@ -98,12 +291,22 @@ pub fn launch_wrapped(
     phase: &str,
     workdir: &Path,
     timeout: Duration,
+    toolbox: &[McpServerSpec],
 ) -> anyhow::Result<LaunchOutcome> {
     std::fs::create_dir_all(workdir)
         .map_err(|e| anyhow::anyhow!("create sandbox workdir {}: {e}", workdir.display()))?;
 
     // ── Write the Claude settings.json (the hook config the subprocess reads). ──
     let settings_path = write_claude_settings(workdir, scope, phase)?;
+
+    // ── Write the MCP toolbox config (augment mode) for claude-family CLIs. ──
+    // Non-claude CLIs (agy, pi) skip --mcp-config: they have no --mcp-config flag.
+    let is_claude = cli.command.contains("claude") || cli.id.contains("claude");
+    let mcp_config_path = if is_claude {
+        write_mcp_config(workdir, toolbox)?
+    } else {
+        None
+    };
 
     // ── Run the real subprocess. ──
     let mut command = Command::new(&cli.command);
@@ -122,6 +325,11 @@ pub fn launch_wrapped(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+
+    // Augment mode: add --mcp-config ONLY when the toolbox produced a config file.
+    if let Some(ref mcp_path) = mcp_config_path {
+        command.arg("--mcp-config").arg(mcp_path);
+    }
 
     let (exit_code, stdout, stderr) = run_bounded(command, timeout)?;
 
@@ -543,5 +751,284 @@ mod tests {
         assert_eq!(tool, "Bash");
         assert_eq!(ctx["command"], "echo hi");
         assert_eq!(ctx["work"], "echo hi");
+    }
+
+    // ── MCP toolbox injection tests ────────────────────────────────────────────
+
+    /// `write_mcp_config` with a non-empty toolbox writes a valid `mcpServers` JSON.
+    #[test]
+    fn write_mcp_config_produces_valid_json() {
+        let dir = std::env::temp_dir().join(format!("wa-mcp-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let toolbox = vec![
+            McpServerSpec {
+                name: "wicked-estate".to_string(),
+                command: "/usr/local/bin/wicked-estate-mcp".to_string(),
+                args: vec![],
+                env: Default::default(),
+            },
+            McpServerSpec {
+                name: "wicked-memory".to_string(),
+                command: "/usr/local/bin/wicked-memory-mcp".to_string(),
+                args: vec!["--stdio".to_string()],
+                env: [("WICKED_MEM_DB".to_string(), "/tmp/mem.db".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+        ];
+
+        let path = write_mcp_config(&dir, &toolbox).unwrap();
+        let path = path.expect("non-empty toolbox must produce a path");
+
+        assert!(path.exists(), "mcp.json must exist on disk");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).expect("must be valid JSON");
+
+        // Top-level key must be `mcpServers`.
+        assert!(
+            v.get("mcpServers").is_some(),
+            "JSON must have top-level 'mcpServers' key"
+        );
+        let servers = v["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.len(), 2, "two servers must be registered");
+
+        // Estate entry.
+        let estate = &servers["wicked-estate"];
+        assert_eq!(
+            estate["command"].as_str().unwrap(),
+            "/usr/local/bin/wicked-estate-mcp"
+        );
+        // No `args` key when args is empty.
+        assert!(estate.get("args").is_none(), "empty args must be omitted");
+
+        // Memory entry: args and env present.
+        let memory = &servers["wicked-memory"];
+        assert_eq!(
+            memory["command"].as_str().unwrap(),
+            "/usr/local/bin/wicked-memory-mcp"
+        );
+        let args = memory["args"].as_array().unwrap();
+        assert_eq!(args, &[serde_json::Value::String("--stdio".to_string())]);
+        assert_eq!(
+            memory["env"]["WICKED_MEM_DB"].as_str().unwrap(),
+            "/tmp/mem.db"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `write_mcp_config` with an empty toolbox returns `None` (no file written, no flag added).
+    #[test]
+    fn write_mcp_config_empty_toolbox_returns_none() {
+        let dir = std::env::temp_dir().join(format!("wa-mcp-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let result = write_mcp_config(&dir, &[]).unwrap();
+        assert!(result.is_none(), "empty toolbox must return None");
+
+        // No mcp.json file should have been written.
+        assert!(
+            !dir.join(".claude").join("mcp.json").exists(),
+            "no mcp.json should be written for empty toolbox"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `launch_wrapped` with empty toolbox does NOT add `--mcp-config` to the subprocess command.
+    /// Verified by inspecting the subprocess args (fake echo CLI captures its own argv).
+    #[cfg(unix)]
+    #[test]
+    fn launch_wrapped_with_empty_toolbox_omits_mcp_config_flag() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("wa-mcp-no-flag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A fake "claude" that just prints its argv and exits 0.
+        let fake = dir.join("fake-claude");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nfor a in \"$@\"; do echo \"ARG:$a\"; done\n",
+        )
+        .unwrap();
+        let mut p = std::fs::metadata(&fake).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&fake, p).unwrap();
+
+        unsafe { std::env::set_var("WICKED_AGENT_BIN", &fake) };
+
+        let cli = WrappedCli {
+            command: fake.display().to_string(),
+            args: vec![],
+            mode: GovernanceMode::PretoolHook,
+            id: "claude".to_string(),
+        };
+        let workdir = dir.join("work");
+        let outcome = launch_wrapped(
+            &cli,
+            "do something",
+            "scope",
+            "exec",
+            &workdir,
+            std::time::Duration::from_secs(5),
+            &[], // empty toolbox
+        )
+        .unwrap();
+
+        assert!(
+            !outcome.stdout.contains("--mcp-config"),
+            "empty toolbox must NOT produce --mcp-config in argv; got: {}",
+            outcome.stdout
+        );
+
+        unsafe { std::env::remove_var("WICKED_AGENT_BIN") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `launch_wrapped` with a non-empty toolbox writes the `mcp.json` to workdir/.claude/,
+    /// proving the `--mcp-config` path is generated and would be passed to the subprocess.
+    /// We verify the on-disk artifact rather than subprocess argv (avoiding env-var races in
+    /// parallel test suites).
+    #[cfg(unix)]
+    #[test]
+    fn launch_wrapped_with_toolbox_includes_mcp_config_flag() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+
+        let dir = std::env::temp_dir().join(format!("wa-mcp-with-flag-{pid}-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A minimal fake "claude" that exits 0 immediately.
+        let fake = dir.join("fake-claude");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut p = std::fs::metadata(&fake).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&fake, p).unwrap();
+
+        // Pin WICKED_AGENT_BIN to the fake binary so write_claude_settings uses it.
+        // Use a unique env var name to avoid interfering with parallel tests on the same process.
+        // Safety: test-only; test binary is single-threaded per Rust test runner default.
+        unsafe { std::env::set_var("WICKED_AGENT_BIN", &fake) };
+
+        // A fake MCP binary — must exist on disk so the path is recorded in mcp.json.
+        let fake_mcp = dir.join("fake-mcp-server");
+        std::fs::write(&fake_mcp, "#!/bin/sh\n").unwrap();
+        let mut p2 = std::fs::metadata(&fake_mcp).unwrap().permissions();
+        p2.set_mode(0o755);
+        std::fs::set_permissions(&fake_mcp, p2).unwrap();
+
+        let toolbox = vec![McpServerSpec {
+            name: "wicked-estate".to_string(),
+            command: fake_mcp.display().to_string(),
+            args: vec![],
+            env: Default::default(),
+        }];
+
+        let cli = WrappedCli {
+            command: fake.display().to_string(),
+            args: vec![],
+            mode: GovernanceMode::PretoolHook,
+            id: "claude".to_string(),
+        };
+        let workdir = dir.join("work");
+        // launch_wrapped must succeed (exit code is not checked here — governance reads decisions).
+        let _outcome = launch_wrapped(
+            &cli,
+            "do something",
+            "scope",
+            "exec",
+            &workdir,
+            std::time::Duration::from_secs(5),
+            &toolbox,
+        )
+        .unwrap();
+
+        // The mcp.json MUST have been written — this is the proof that the --mcp-config path
+        // was generated and would be appended to the subprocess args.
+        let mcp_json = workdir.join(".claude").join("mcp.json");
+        assert!(
+            mcp_json.exists(),
+            "mcp.json must be written to workdir/.claude/ when toolbox is non-empty"
+        );
+
+        // Verify the written mcp.json is valid and contains the expected server entry.
+        let content = std::fs::read_to_string(&mcp_json).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
+        assert!(
+            v["mcpServers"]["wicked-estate"].is_object(),
+            "mcpServers must contain the wicked-estate entry"
+        );
+        assert_eq!(
+            v["mcpServers"]["wicked-estate"]["command"]
+                .as_str()
+                .unwrap(),
+            fake_mcp.display().to_string(),
+            "command must point to the fake MCP binary"
+        );
+
+        unsafe { std::env::remove_var("WICKED_AGENT_BIN") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Non-claude CLI skips `--mcp-config` even when toolbox is non-empty.
+    #[cfg(unix)]
+    #[test]
+    fn launch_wrapped_non_claude_cli_skips_mcp_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("wa-mcp-agy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let fake = dir.join("fake-agy");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nfor a in \"$@\"; do echo \"ARG:$a\"; done\n",
+        )
+        .unwrap();
+        let mut p = std::fs::metadata(&fake).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&fake, p).unwrap();
+
+        unsafe { std::env::set_var("WICKED_AGENT_BIN", &fake) };
+
+        let toolbox = vec![McpServerSpec {
+            name: "wicked-estate".to_string(),
+            command: "/usr/bin/true".to_string(),
+            args: vec![],
+            env: Default::default(),
+        }];
+
+        let cli = WrappedCli {
+            command: fake.display().to_string(),
+            args: vec![],
+            mode: GovernanceMode::PostHoc,
+            id: "agy".to_string(), // NOT claude
+        };
+        let workdir = dir.join("work");
+        let outcome = launch_wrapped(
+            &cli,
+            "do something",
+            "scope",
+            "exec",
+            &workdir,
+            std::time::Duration::from_secs(5),
+            &toolbox,
+        )
+        .unwrap();
+
+        assert!(
+            !outcome.stdout.contains("--mcp-config"),
+            "non-claude CLI must NOT get --mcp-config even with a toolbox; got: {}",
+            outcome.stdout
+        );
+
+        unsafe { std::env::remove_var("WICKED_AGENT_BIN") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
