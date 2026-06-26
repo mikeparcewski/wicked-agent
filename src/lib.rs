@@ -54,7 +54,7 @@ pub use execute::{
     execute_unit, execute_unit_wrapped, UnitOutcome, DEFAULT_CLI_TIMEOUT, WORK_OUTPUT,
 };
 pub use inject::{
-    launch_wrapped, run_gate_hook, GovernanceMode, LaunchOutcome, ToolCall, WrappedCli,
+    launch_wrapped, parse_decisions_file, run_gate_hook, GovernanceMode, LaunchOutcome, WrappedCli,
 };
 pub use plan::plan_units;
 pub use scope::{resolve_scope, EntityMode};

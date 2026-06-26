@@ -243,7 +243,6 @@ pub fn execute_unit_wrapped(
         None
     } else {
         Some(launch_wrapped(
-            store,
             cli,
             &unit.description,
             &collection_scope,
@@ -369,10 +368,6 @@ fn real_work_output_node(
         if let Some(p) = &l.artifact_path {
             m.insert("artifact_path".into(), serde_json::Value::String(p.clone()));
         }
-        m.insert(
-            "tool_call_count".into(),
-            serde_json::json!(l.tool_calls.len()),
-        );
     }
     node
 }
