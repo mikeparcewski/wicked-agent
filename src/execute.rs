@@ -531,3 +531,264 @@ fn decision_token(decision: &Decision) -> &'static str {
         Decision::AllowWithConditions => "allow_with_conditions",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! EXECUTE-LAYER WIRING tests — prove the `discover_toolbox()` → `launch_wrapped` path at the
+    //! execute layer (execute.rs:`execute_unit_wrapped`, the `crate::inject::discover_toolbox()`
+    //! call feeding `launch_wrapped`). These are hermetic: a deterministic fake "claude" CLI (so
+    //! `is_claude` is true and the MCP-config branch is taken) + fake MCP binaries pinned via
+    //! env-overrides. NO real claude, NO real MCP servers. The observable proof at this layer is the
+    //! `mcp.json` written into the unit's workdir/.claude/ carrying exactly the discovered servers.
+    //!
+    //! ADVERSARIAL — env determinism: `discover_toolbox` reads process-global env. This module locks
+    //! the SAME crate-wide `crate::inject::MCP_ENV_LOCK` that `inject::tests` uses (the lib's unit
+    //! tests share one process), neutralizes PATH + cargo-home so ONLY the env-overrides resolve,
+    //! and restores every touched var on Drop via `EnvGuard`. Gated `#[cfg(unix)]` to match the
+    //! fake-shell-script fixtures.
+
+    use super::*;
+    use crate::inject::{GovernanceMode, WrappedCli, MCP_ENV_LOCK};
+    use crate::WorkUnit;
+    use wicked_apps_core::SqliteStore;
+
+    /// Save/restore guard for env vars (records current value/absence; restores exactly on Drop,
+    /// even on panic). Mirrors `inject::tests::EnvGuard` — kept local so this module is independent.
+    struct EnvGuard {
+        saved: Vec<(String, Option<std::ffi::OsString>)>,
+    }
+    impl EnvGuard {
+        fn capture(keys: &[&str]) -> Self {
+            EnvGuard {
+                saved: keys
+                    .iter()
+                    .map(|k| ((*k).to_string(), std::env::var_os(k)))
+                    .collect(),
+            }
+        }
+        fn set(&self, key: &str, val: impl AsRef<std::ffi::OsStr>) {
+            unsafe { std::env::set_var(key, val) };
+        }
+        fn remove(&self, key: &str) {
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(val) => unsafe { std::env::set_var(k, val) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+        }
+    }
+
+    /// Every env var the resolver + settings writer read, plus the gate-hook bin pin.
+    const GUARDED_ENV: &[&str] = &[
+        "WICKED_ESTATE_MCP_BIN",
+        "WICKED_MEMORY_MCP_BIN",
+        "WICKED_KNOWLEDGE_MCP_BIN",
+        "PATH",
+        "CARGO_HOME",
+        "HOME",
+        "USERPROFILE",
+        "WICKED_AGENT_BIN",
+        "WICKED_ESTATE_DB",
+    ];
+
+    /// A unique temp dir for one test.
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("wa-exec-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write an executable shell script and return its path (unix only).
+    #[cfg(unix)]
+    fn write_exe(path: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        let mut perm = std::fs::metadata(path).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(path, perm).unwrap();
+        path.to_path_buf()
+    }
+
+    /// EXECUTE-LAYER WIRING (full path): drive a real `execute_unit_wrapped` with a fake claude CLI
+    /// and env-overrides pinned to fake MCP binaries. The unit-level gate (no policy) allows, the
+    /// fake claude is launched, and `execute_unit_wrapped`'s `discover_toolbox()` call must feed
+    /// `launch_wrapped`, which writes `mcp.json` into the unit's workdir/.claude/. We assert that
+    /// file exists and carries exactly the two pinned servers — the durable proof of the wiring.
+    #[cfg(unix)]
+    #[test]
+    fn execute_unit_wrapped_writes_mcp_config_from_discovered_toolbox() {
+        let _lock = MCP_ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::capture(GUARDED_ENV);
+
+        let dir = unique_dir("wire");
+
+        // Neutralize PATH + cargo-home so ONLY our env-overrides can resolve a server.
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        guard.set("PATH", &empty);
+        guard.set("CARGO_HOME", &empty);
+        guard.set("HOME", &empty);
+        guard.set("USERPROFILE", &empty);
+
+        // Fake "claude" CLI: exits 0 immediately. id="claude" makes `is_claude` true → MCP branch.
+        let fake_claude = write_exe(&dir.join("fake-claude"), "#!/bin/sh\nexit 0\n");
+        // Pin WICKED_AGENT_BIN so write_claude_settings has a hook exe path (never actually run).
+        guard.set("WICKED_AGENT_BIN", &fake_claude);
+        // No real store DB needed; keep gate-hook db empty (the fake claude never calls it).
+        guard.remove("WICKED_ESTATE_DB");
+
+        // Fake MCP binaries that EXIST (so resolve_mcp_binary's `.exists()` passes) for estate+memory;
+        // knowledge has NO override → omitted, proving discover_toolbox filters to the resolvable set.
+        let fake_estate = write_exe(&dir.join("fake-estate-mcp"), "#!/bin/sh\n");
+        let fake_memory = write_exe(&dir.join("fake-memory-mcp"), "#!/bin/sh\n");
+        guard.set("WICKED_ESTATE_MCP_BIN", &fake_estate);
+        guard.set("WICKED_MEMORY_MCP_BIN", &fake_memory);
+        guard.remove("WICKED_KNOWLEDGE_MCP_BIN");
+
+        // Sanity: discover_toolbox under these exact env conditions must yield exactly estate+memory.
+        let discovered = crate::inject::discover_toolbox();
+        assert_eq!(
+            discovered.len(),
+            2,
+            "estate+memory resolvable, knowledge omitted; got: {discovered:?}"
+        );
+
+        let mut store = SqliteStore::in_memory().expect("open in-memory store");
+        let unit = WorkUnit::pending("sess-wire:u1", "sess-wire", 1, "do the wiring work");
+        let cli = WrappedCli {
+            command: fake_claude.display().to_string(),
+            args: vec![],
+            mode: GovernanceMode::PretoolHook,
+            id: "claude".to_string(), // claude-family → gets --mcp-config
+        };
+        let workdir = dir.join("workdir");
+
+        let outcome = execute_unit_wrapped(
+            &mut store,
+            &unit,
+            &cli,
+            "wf-wire",
+            EntityMode::Shared,
+            "sess-wire",
+            &workdir,
+            Duration::from_secs(10),
+        )
+        .expect("execute_unit_wrapped");
+
+        // The unit-level gate had no deny policy → the CLI was launched (a phase resolved).
+        assert_eq!(
+            outcome.decision.as_deref(),
+            Some("allow"),
+            "no policy → unit-level gate allows; got {outcome:?}"
+        );
+
+        // THE PROOF: execute_unit_wrapped → discover_toolbox() → launch_wrapped wrote mcp.json into
+        // the unit's workdir/.claude/ with exactly the discovered (resolvable) servers.
+        let mcp_json = workdir.join(".claude").join("mcp.json");
+        assert!(
+            mcp_json.exists(),
+            "execute_unit_wrapped must write mcp.json into workdir/.claude/ via the discover→launch wiring"
+        );
+        let content = std::fs::read_to_string(&mcp_json).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).expect("valid mcp.json");
+        let servers = v["mcpServers"].as_object().expect("mcpServers object");
+        assert_eq!(servers.len(), 2, "exactly the two resolvable servers");
+        assert_eq!(
+            servers["wicked-estate"]["command"].as_str().unwrap(),
+            fake_estate.display().to_string(),
+            "estate command must be the pinned fake binary path"
+        );
+        assert_eq!(
+            servers["wicked-memory"]["command"].as_str().unwrap(),
+            fake_memory.display().to_string(),
+            "memory command must be the pinned fake binary path"
+        );
+        assert!(
+            !servers.contains_key("wicked-knowledge"),
+            "knowledge had no resolvable layer → must be absent from the written config"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        // guard drops → GUARDED_ENV restored.
+    }
+
+    /// EXECUTE-LAYER GRACEFUL DEGRADATION: with NO server resolvable (all overrides nonexistent,
+    /// PATH + cargo-home neutralized), `execute_unit_wrapped` still runs the fake claude to
+    /// completion and writes NO mcp.json — the empty-toolbox path. Proves the execute layer degrades
+    /// gracefully (fewer tools, not a hard error) and adds no `--mcp-config`.
+    #[cfg(unix)]
+    #[test]
+    fn execute_unit_wrapped_empty_toolbox_writes_no_mcp_config() {
+        let _lock = MCP_ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::capture(GUARDED_ENV);
+
+        let dir = unique_dir("empty-wire");
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        guard.set("PATH", &empty);
+        guard.set("CARGO_HOME", &empty);
+        guard.set("HOME", &empty);
+        guard.set("USERPROFILE", &empty);
+
+        let fake_claude = write_exe(&dir.join("fake-claude"), "#!/bin/sh\nexit 0\n");
+        guard.set("WICKED_AGENT_BIN", &fake_claude);
+        guard.remove("WICKED_ESTATE_DB");
+
+        // All overrides point at a nonexistent path → no layer resolves any server.
+        let ghost = empty.join("ghost");
+        guard.set("WICKED_ESTATE_MCP_BIN", &ghost);
+        guard.set("WICKED_MEMORY_MCP_BIN", &ghost);
+        guard.set("WICKED_KNOWLEDGE_MCP_BIN", &ghost);
+        assert!(
+            crate::inject::discover_toolbox().is_empty(),
+            "no resolvable server → discover_toolbox empty under these env conditions"
+        );
+
+        let mut store = SqliteStore::in_memory().expect("open in-memory store");
+        let unit = WorkUnit::pending("sess-empty:u1", "sess-empty", 1, "work with no toolbox");
+        let cli = WrappedCli {
+            command: fake_claude.display().to_string(),
+            args: vec![],
+            mode: GovernanceMode::PretoolHook,
+            id: "claude".to_string(),
+        };
+        let workdir = dir.join("workdir");
+
+        let outcome = execute_unit_wrapped(
+            &mut store,
+            &unit,
+            &cli,
+            "wf-empty",
+            EntityMode::Shared,
+            "sess-empty",
+            &workdir,
+            Duration::from_secs(10),
+        )
+        .expect("execute_unit_wrapped");
+        assert_eq!(outcome.decision.as_deref(), Some("allow"));
+
+        // No mcp.json written for an empty toolbox (settings.json IS written — that's the hook config).
+        let mcp_json = workdir.join(".claude").join("mcp.json");
+        assert!(
+            !mcp_json.exists(),
+            "an empty discovered toolbox must NOT write mcp.json"
+        );
+        // The settings.json (governance hook) is unrelated to MCP and must still be present.
+        assert!(
+            workdir.join(".claude").join("settings.json").exists(),
+            "settings.json (the gate hook) is always written, independent of the toolbox"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
