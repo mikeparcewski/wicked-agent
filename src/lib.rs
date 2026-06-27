@@ -47,6 +47,7 @@ pub mod distribute;
 pub mod execute;
 pub mod inject;
 pub mod plan;
+pub mod resume;
 pub mod scope;
 
 pub use distribute::{distribute_units, distribute_units_on, Distribution};
@@ -59,6 +60,7 @@ pub use inject::{
     GovernanceMode, LaunchOutcome, McpServerSpec, WrappedCli,
 };
 pub use plan::plan_units;
+pub use resume::{get_cursor, put_cursor, ResumeCursor, AGENT_RESUME_CURSOR};
 pub use scope::{resolve_scope, EntityMode};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -86,7 +88,25 @@ pub enum SessionStatus {
     Planning,
     Distributing,
     Executing,
+    /// The run paused BEFORE a not-yet-done unit, awaiting a human to resume (a [`ResumeCursor`] is
+    /// persisted). `wicked-agent resume <session_id>` continues from where it paused.
+    AwaitingHuman,
     Completed,
+}
+
+/// The human-confirm gate policy for a wrapped session run — decides whether the harness pauses
+/// BEFORE executing a unit so a human can confirm (and later `resume`).
+///
+/// - [`None`](HumanConfirm::None): never pause (the default — byte-for-byte the pre-gate behavior).
+/// - [`All`](HumanConfirm::All): pause before EVERY not-yet-done unit.
+/// - [`Before`](HumanConfirm::Before): pause before the unit whose `ord` equals the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanConfirm {
+    #[default]
+    None,
+    All,
+    Before(u32),
 }
 
 /// An agent session — the OWNED interactive flow, persisted as `Node(Other(AGENT_SESSION))` on the
@@ -107,6 +127,10 @@ pub struct AgentSession {
     pub clis: Vec<String>,
     /// Lifecycle status.
     pub status: SessionStatus,
+    /// The human-confirm gate policy for this run. `#[serde(default)]` so sessions persisted BEFORE
+    /// this field existed still deserialize (defaulting to [`HumanConfirm::None`]).
+    #[serde(default)]
+    pub human_confirm: HumanConfirm,
 }
 
 impl ToNode for AgentSession {
@@ -308,6 +332,10 @@ pub struct SessionResult {
     pub units: Vec<UnitOutcome>,
     pub approved: usize,
     pub rejected: usize,
+    /// `Some(ord)` when the run PAUSED before that unit (a [`ResumeCursor`] is persisted); `None` on
+    /// full completion. Only the wrapped run/resume path sets this; `run_session` always reports `None`.
+    #[serde(default)]
+    pub paused_at: Option<u32>,
 }
 
 /// Run a full governed session over ONE shared [`SqliteStore`].
@@ -352,6 +380,7 @@ pub fn run_session(
         collection_scope: collection_scope.clone(),
         clis: cli_keys.clone(),
         status: SessionStatus::Planning,
+        human_confirm: HumanConfirm::None,
     };
     put_node(store, session.to_node())?;
 
@@ -504,6 +533,7 @@ pub fn run_session(
         units: outcomes,
         approved,
         rejected,
+        paused_at: None,
     })
 }
 
@@ -520,6 +550,11 @@ pub fn run_session(
 /// `governance_mode` selects the per-tool-call mechanism for the launched CLIs (pretool-hook vs
 /// post-hoc). Everything persists on the ONE `store`: session, units (+assignment/outcome), claims,
 /// phases, and each approved unit's REAL work-output node.
+///
+/// `human_confirm` is the pause-before-unit gate (see [`HumanConfirm`]). When the run pauses, a
+/// [`ResumeCursor`] is persisted, the session + workflow are set to `AwaitingHuman`, and the call
+/// returns early with `paused_at = Some(ord)`. [`resume_session`] continues from there. The default
+/// [`HumanConfirm::None`] never pauses — the run is byte-for-byte the pre-gate behavior.
 #[allow(clippy::too_many_arguments)]
 pub fn run_session_wrapped(
     store: &mut SqliteStore,
@@ -530,6 +565,7 @@ pub fn run_session_wrapped(
     governance_mode: inject::GovernanceMode,
     sandbox_root: &std::path::Path,
     timeout: std::time::Duration,
+    human_confirm: HumanConfirm,
 ) -> anyhow::Result<SessionResult> {
     use wicked_apps_core::emit::{emit_event, EmitEvent};
 
@@ -555,6 +591,7 @@ pub fn run_session_wrapped(
         collection_scope: collection_scope.clone(),
         clis: cli_keys.clone(),
         status: SessionStatus::Planning,
+        human_confirm,
     };
     put_node(store, session.to_node())?;
     let _ = emit_event(&EmitEvent::new(
@@ -616,62 +653,39 @@ pub fn run_session_wrapped(
 
     let mut outcomes: Vec<UnitOutcome> = Vec::with_capacity(units.len());
     for u in &mut units {
-        let assigned = u
-            .assigned_cli
-            .clone()
-            .unwrap_or_else(|| "claude".to_string());
-        let wrapped = wrapped_cli_for(&assigned, &clis, governance_mode);
-        let workdir = sandbox_root.join(&session_id).join(&u.id);
-        let mut outcome = execute::execute_unit_wrapped(
+        // HUMAN-CONFIRM GATE: pause BEFORE executing this unit if the policy says so — but never
+        // pause on a unit already resolved (resume safety; only relevant when this is a re-run).
+        let already_resolved = matches!(u.status, UnitStatus::Done | UnitStatus::Rejected);
+        if !already_resolved && should_pause(human_confirm, u.ord) {
+            return pause_wrapped_run(
+                store,
+                &session,
+                &workflow_id,
+                u.ord,
+                problem,
+                entity_mode,
+                &collection_scope,
+                governance_mode,
+                sandbox_root,
+                timeout,
+                &clis,
+                human_confirm,
+                outcomes,
+            );
+        }
+
+        let outcome = execute_one_unit_wrapped(
             store,
             u,
-            &wrapped,
+            &clis,
+            &cli_keys,
             &workflow_id,
             entity_mode,
             &session_id,
-            &workdir,
+            governance_mode,
+            sandbox_root,
             timeout,
         )?;
-
-        // evaluator≠creator: second governance pass on approved units.
-        if outcome.approved {
-            let evaluator_cli = next_cli_in_roster(&outcome.assigned_cli, &cli_keys);
-            let eval_at = execute::EVAL_AT_BASE + u.ord as i64 + 1_000_000;
-            if let Ok(eval) = execute::evaluate_unit(
-                store,
-                u,
-                &outcome
-                    .artifact_path
-                    .clone()
-                    .unwrap_or_else(|| format!("stub-output for {}", u.description)),
-                &evaluator_cli,
-                &outcome.collection_scope,
-                &format!("unit-{}", u.ord),
-                eval_at,
-            ) {
-                outcome.evaluator_claim_id = Some(eval.claim_id);
-            }
-        }
-
-        // Tick the workflow cursor.
-        wicked_orchestration::tick_workflow(store, &workflow_id, outcome.approved)?;
-
-        u.phase_ref = Some(outcome.phase_id.clone());
-        u.conformance_ref = outcome.claim_id.clone();
-        u.phase_status = Some(outcome.phase_status.clone());
-        u.collection_scope = Some(outcome.collection_scope.clone());
-        u.status = if outcome.approved {
-            UnitStatus::Done
-        } else {
-            UnitStatus::Rejected
-        };
-        put_node(store, u.to_node())?;
-        let _ = emit_event(&EmitEvent::new(
-            EV_AGENT_TASK_COMPLETED,
-            "wicked-agent",
-            "agent.task",
-            serde_json::json!({ "session_id": session_id, "unit_id": u.id, "phase_status": outcome.phase_status, "decision": outcome.decision, "gate_blocked": outcome.gate_blocked }),
-        ));
         outcomes.push(outcome);
     }
 
@@ -695,7 +709,343 @@ pub fn run_session_wrapped(
         units: outcomes,
         approved,
         rejected,
+        paused_at: None,
     })
+}
+
+/// Decide whether the human-confirm gate pauses BEFORE a unit of the given `ord`.
+fn should_pause(human_confirm: HumanConfirm, ord: u32) -> bool {
+    match human_confirm {
+        HumanConfirm::None => false,
+        HumanConfirm::All => true,
+        HumanConfirm::Before(target) => ord == target,
+    }
+}
+
+/// Execute ONE unit on the REAL wrapped-CLI path, end to end, on the shared `store`:
+/// `wrapped_cli_for` → [`execute::execute_unit_wrapped`] → evaluator≠creator second pass →
+/// [`wicked_orchestration::tick_workflow`] → update the unit node fields/status → emit
+/// `EV_AGENT_TASK_COMPLETED`. Returns the [`UnitOutcome`].
+///
+/// Both [`run_session_wrapped`] and [`resume_session`] call this so the per-unit behavior is
+/// IDENTICAL on both paths (the logic is the byte-for-byte equivalent of the original execute-loop
+/// body).
+#[allow(clippy::too_many_arguments)]
+fn execute_one_unit_wrapped(
+    store: &mut SqliteStore,
+    u: &mut WorkUnit,
+    clis: &[wicked_council::AgenticCli],
+    cli_keys: &[String],
+    workflow_id: &str,
+    entity_mode: EntityMode,
+    session_id: &str,
+    governance_mode: inject::GovernanceMode,
+    sandbox_root: &std::path::Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<UnitOutcome> {
+    use wicked_apps_core::emit::{emit_event, EmitEvent};
+
+    let assigned = u
+        .assigned_cli
+        .clone()
+        .unwrap_or_else(|| "claude".to_string());
+    let wrapped = wrapped_cli_for(&assigned, clis, governance_mode);
+    let workdir = sandbox_root.join(session_id).join(&u.id);
+    let mut outcome = execute::execute_unit_wrapped(
+        store,
+        u,
+        &wrapped,
+        workflow_id,
+        entity_mode,
+        session_id,
+        &workdir,
+        timeout,
+    )?;
+
+    // evaluator≠creator: second governance pass on approved units.
+    if outcome.approved {
+        let evaluator_cli = next_cli_in_roster(&outcome.assigned_cli, cli_keys);
+        let eval_at = execute::EVAL_AT_BASE + u.ord as i64 + 1_000_000;
+        if let Ok(eval) = execute::evaluate_unit(
+            store,
+            u,
+            &outcome
+                .artifact_path
+                .clone()
+                .unwrap_or_else(|| format!("stub-output for {}", u.description)),
+            &evaluator_cli,
+            &outcome.collection_scope,
+            &format!("unit-{}", u.ord),
+            eval_at,
+        ) {
+            outcome.evaluator_claim_id = Some(eval.claim_id);
+        }
+    }
+
+    // Tick the workflow cursor.
+    wicked_orchestration::tick_workflow(store, workflow_id, outcome.approved)?;
+
+    u.phase_ref = Some(outcome.phase_id.clone());
+    u.conformance_ref = outcome.claim_id.clone();
+    u.phase_status = Some(outcome.phase_status.clone());
+    u.collection_scope = Some(outcome.collection_scope.clone());
+    u.status = if outcome.approved {
+        UnitStatus::Done
+    } else {
+        UnitStatus::Rejected
+    };
+    put_node(store, u.to_node())?;
+    let _ = emit_event(&EmitEvent::new(
+        EV_AGENT_TASK_COMPLETED,
+        "wicked-agent",
+        "agent.task",
+        serde_json::json!({ "session_id": session_id, "unit_id": u.id, "phase_status": outcome.phase_status, "decision": outcome.decision, "gate_blocked": outcome.gate_blocked }),
+    ));
+    Ok(outcome)
+}
+
+/// PAUSE the wrapped run BEFORE the unit `next_ord`: persist a [`ResumeCursor`] (overwrite), set the
+/// session + workflow to `AwaitingHuman`, and return a `SessionResult` with `paused_at = Some(ord)`.
+/// The workflow cursor is NOT advanced past the un-executed unit (it stays consistent for resume).
+#[allow(clippy::too_many_arguments)]
+fn pause_wrapped_run(
+    store: &mut SqliteStore,
+    session: &AgentSession,
+    workflow_id: &str,
+    next_ord: u32,
+    problem: &str,
+    entity_mode: EntityMode,
+    collection_scope: &Option<String>,
+    governance_mode: inject::GovernanceMode,
+    sandbox_root: &std::path::Path,
+    timeout: std::time::Duration,
+    clis: &[wicked_council::AgenticCli],
+    human_confirm: HumanConfirm,
+    outcomes: Vec<UnitOutcome>,
+) -> anyhow::Result<SessionResult> {
+    // Persist the FULL resume cursor (overwrite, not append) — the full Vec<AgenticCli> so
+    // `wrapped_cli_for` can rebuild the subprocess commands on resume.
+    let cursor = resume::ResumeCursor {
+        session_id: session.id.clone(),
+        workflow_id: workflow_id.to_string(),
+        next_ord,
+        problem: problem.to_string(),
+        entity_mode,
+        collection_scope: collection_scope.clone(),
+        governance_mode,
+        sandbox_root: sandbox_root.display().to_string(),
+        timeout_secs: timeout.as_secs(),
+        clis: clis.to_vec(),
+        human_confirm,
+    };
+    resume::put_cursor(store, &cursor)?;
+
+    // Set the session to AwaitingHuman and persist it.
+    let mut paused_session = session.clone();
+    paused_session.status = SessionStatus::AwaitingHuman;
+    put_node(store, paused_session.to_node())?;
+
+    // Set the workflow status to AwaitingHuman via the orchestration public API and re-persist.
+    // (The harness's tick_workflow never sets AwaitingHuman, so we set it directly.)
+    if let Some(mut wf) = wicked_orchestration::get_workflow(store, workflow_id)? {
+        wf.status = wicked_orchestration::WorkflowStatus::AwaitingHuman;
+        put_node(store, wf.to_node())?;
+    }
+
+    let approved = outcomes.iter().filter(|o| o.approved).count();
+    let rejected = outcomes.len() - approved;
+    Ok(SessionResult {
+        session_id: session.id.clone(),
+        workflow_id: workflow_id.to_string(),
+        entity_mode,
+        collection_scope: collection_scope.clone(),
+        units: outcomes,
+        approved,
+        rejected,
+        paused_at: Some(next_ord),
+    })
+}
+
+/// RESUME a paused wrapped session from its persisted [`ResumeCursor`].
+///
+/// Loads the cursor (via [`resume::get_cursor`]), re-reads the persisted units (they already carry
+/// their council assignments — resume does NOT re-plan or re-distribute), and continues the execute
+/// loop from the cursor's `next_ord`, SKIPPING units already `Done`/`Rejected`. The cursor's FULL
+/// `Vec<AgenticCli>` rebuilds each subprocess command via `wrapped_cli_for`. The cursor's
+/// `human_confirm` is honored, so resume can pause AGAIN (persisting a fresh cursor — overwrite).
+///
+/// On reaching the end: session → `Completed`, workflow → `Complete`, `paused_at = None`. Idempotent:
+/// resuming a session with no cursor (already fully complete) returns the completed result WITHOUT
+/// re-executing or double-ticking the workflow.
+pub fn resume_session(store: &mut SqliteStore, session_id: &str) -> anyhow::Result<SessionResult> {
+    use wicked_apps_core::emit::{emit_event, EmitEvent};
+
+    let session = get_session(store, session_id)?
+        .ok_or_else(|| anyhow::anyhow!("no session {session_id:?} found on the store"))?;
+    let workflow_id = session.workflow_id.clone();
+
+    // IDEMPOTENT no-op: an already-`Completed` session re-derives its completed result from the
+    // persisted units WITHOUT re-executing or re-ticking the workflow. (The session status is the
+    // authoritative completion signal; any lingering cursor is ignored.)
+    if session.status == SessionStatus::Completed {
+        let units = session_units(store, session_id)?;
+        let outcomes: Vec<UnitOutcome> = units.iter().map(unit_outcome_from_node).collect();
+        let approved = outcomes.iter().filter(|o| o.approved).count();
+        let rejected = outcomes.len() - approved;
+        return Ok(SessionResult {
+            session_id: session.id,
+            workflow_id,
+            entity_mode: session.entity_mode,
+            collection_scope: session.collection_scope,
+            units: outcomes,
+            approved,
+            rejected,
+            paused_at: None,
+        });
+    }
+
+    // No cursor + not Completed ⇒ nothing to resume from (e.g. a stub session, or a never-paused
+    // wrapped session). Treat as a no-op completed read so resume is total/safe.
+    let Some(cursor) = resume::get_cursor(store, session_id)? else {
+        let units = session_units(store, session_id)?;
+        let outcomes: Vec<UnitOutcome> = units.iter().map(unit_outcome_from_node).collect();
+        let approved = outcomes.iter().filter(|o| o.approved).count();
+        let rejected = outcomes.len() - approved;
+        return Ok(SessionResult {
+            session_id: session.id,
+            workflow_id,
+            entity_mode: session.entity_mode,
+            collection_scope: session.collection_scope,
+            units: outcomes,
+            approved,
+            rejected,
+            paused_at: None,
+        });
+    };
+
+    let clis = cursor.clis.clone();
+    let cli_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
+    let entity_mode = cursor.entity_mode;
+    let governance_mode = cursor.governance_mode;
+    let sandbox_root = std::path::PathBuf::from(&cursor.sandbox_root);
+    let timeout = std::time::Duration::from_secs(cursor.timeout_secs);
+    let human_confirm = cursor.human_confirm;
+
+    // Re-mark the session as Executing for the resumed run (it was AwaitingHuman).
+    let mut session = session;
+    session.status = SessionStatus::Executing;
+    put_node(store, session.to_node())?;
+
+    // Re-read the persisted units (they carry their assignments — do NOT re-distribute).
+    let mut units = session_units(store, session_id)?;
+
+    // Outcomes already executed on prior runs (persisted on the unit nodes) come first, in order.
+    let mut outcomes: Vec<UnitOutcome> = Vec::with_capacity(units.len());
+    for u in &units {
+        if matches!(u.status, UnitStatus::Done | UnitStatus::Rejected) {
+            outcomes.push(unit_outcome_from_node(u));
+        }
+    }
+
+    // Continue the loop from next_ord, skipping already-resolved units, honoring human_confirm.
+    //
+    // The unit at `next_ord` is the one the human CONFIRMED by invoking resume — it executes WITHOUT
+    // re-triggering the pause gate (otherwise `Before(N)`/`All` would deadlock: resume would pause on
+    // the very unit it is resuming into, forever). The gate still fires for units AFTER `next_ord`,
+    // so a multi-pause run (e.g. `All`) pauses once per remaining unit across successive resumes.
+    for u in &mut units {
+        if u.ord < cursor.next_ord {
+            continue;
+        }
+        let already_resolved = matches!(u.status, UnitStatus::Done | UnitStatus::Rejected);
+        if already_resolved {
+            continue;
+        }
+        if u.ord > cursor.next_ord && should_pause(human_confirm, u.ord) {
+            return pause_wrapped_run(
+                store,
+                &session,
+                &workflow_id,
+                u.ord,
+                &cursor.problem,
+                entity_mode,
+                &cursor.collection_scope,
+                governance_mode,
+                &sandbox_root,
+                timeout,
+                &clis,
+                human_confirm,
+                outcomes,
+            );
+        }
+
+        let outcome = execute_one_unit_wrapped(
+            store,
+            u,
+            &clis,
+            &cli_keys,
+            &workflow_id,
+            entity_mode,
+            session_id,
+            governance_mode,
+            &sandbox_root,
+            timeout,
+        )?;
+        outcomes.push(outcome);
+    }
+
+    // ── Completion: session → Completed (the authoritative completion signal for idempotency), the
+    //    workflow is already Complete via the last unit's tick_workflow, event emitted. ──
+    session.status = SessionStatus::Completed;
+    put_node(store, session.to_node())?;
+
+    let approved = outcomes.iter().filter(|o| o.approved).count();
+    let rejected = outcomes.len() - approved;
+    let _ = emit_event(&EmitEvent::new(
+        EV_AGENT_SESSION_COMPLETED,
+        "wicked-agent",
+        "agent.session",
+        serde_json::json!({ "session_id": session_id, "units": outcomes.len(), "approved": approved, "rejected": rejected }),
+    ));
+
+    Ok(SessionResult {
+        session_id: session.id,
+        workflow_id,
+        entity_mode,
+        collection_scope: cursor.collection_scope,
+        units: outcomes,
+        approved,
+        rejected,
+        paused_at: None,
+    })
+}
+
+/// Reconstruct a [`UnitOutcome`] summary from a persisted (already-executed) [`WorkUnit`] node, for
+/// the resume path's "outcomes already done on prior runs" list. Mirrors what the original run
+/// recorded onto the node; fields the node does not carry (cli_exit_code, artifact_path) are `None`.
+fn unit_outcome_from_node(u: &WorkUnit) -> UnitOutcome {
+    let approved = matches!(u.status, UnitStatus::Done);
+    UnitOutcome {
+        unit_id: u.id.clone(),
+        ord: u.ord,
+        assigned_cli: u.assigned_cli.clone().unwrap_or_default(),
+        phase_id: u
+            .phase_ref
+            .clone()
+            .unwrap_or_else(|| format!("{}:unit-{}", u.session_id, u.ord)),
+        phase_status: u
+            .phase_status
+            .clone()
+            .unwrap_or_else(|| if approved { "approved" } else { "rejected" }.to_string()),
+        decision: None,
+        claim_id: u.conformance_ref.clone(),
+        collection_scope: u.collection_scope.clone().unwrap_or_default(),
+        approved,
+        cli_exit_code: None,
+        artifact_path: None,
+        gate_blocked: false,
+        evaluator_claim_id: None,
+    }
 }
 
 /// Map a council-assigned CLI key back to a launchable [`WrappedCli`] using the convened roster.
@@ -1125,5 +1475,414 @@ mod tests {
             outcome.claim_id.is_some(),
             "governance gate must fire even on ranked-fast-path distribution"
         );
+    }
+
+    // ── human-confirm gate + resume tests ──────────────────────────────────────
+
+    /// Run a wrapped session over fake CLIs with no `WICKED_ESTATE_DB` set (in-memory store) so the
+    /// helper is deterministic and never touches a real `claude` binary.
+    fn run_wrapped(
+        store: &mut SqliteStore,
+        clis: Vec<AgenticCli>,
+        problem: &str,
+        session_id: &str,
+        sandbox: &std::path::Path,
+        human_confirm: HumanConfirm,
+    ) -> SessionResult {
+        run_session_wrapped(
+            store,
+            clis,
+            problem,
+            EntityMode::Shared,
+            Some(session_id),
+            GovernanceMode::PretoolHook,
+            sandbox,
+            std::time::Duration::from_secs(30),
+            human_confirm,
+        )
+        .expect("run_session_wrapped")
+    }
+
+    /// Pause→resume round-trip: `Before(2)` pauses with paused_at==Some(2), session+workflow are
+    /// AwaitingHuman, the cursor is persisted with next_ord==2 and the FULL clis; then resume
+    /// completes it (all units Done, workflow Complete) using ONLY the cursor's persisted clis.
+    #[test]
+    fn pause_before_2_then_resume_completes() {
+        let dir = unique_tempdir("pause-resume");
+        let clis = two_fake_clis(&dir);
+        let sandbox = dir.join("sandbox");
+        let mut store = SqliteStore::in_memory().expect("open store");
+
+        // ── PAUSE before unit 2. ──
+        let paused = run_wrapped(
+            &mut store,
+            clis,
+            "design\nimplement",
+            "sess-pause-resume",
+            &sandbox,
+            HumanConfirm::Before(2),
+        );
+        assert_eq!(paused.paused_at, Some(2), "must pause before unit ord 2");
+        assert_eq!(
+            paused.units.len(),
+            1,
+            "only unit 1 executed before the pause"
+        );
+        assert!(paused.units[0].approved, "unit 1 should be approved");
+
+        // Session + workflow are AwaitingHuman.
+        let sess = get_session(&store, "sess-pause-resume")
+            .expect("read session")
+            .expect("session exists");
+        assert_eq!(sess.status, SessionStatus::AwaitingHuman);
+        let wf = get_workflow(&store, &paused.workflow_id)
+            .expect("read wf")
+            .expect("wf exists");
+        assert_eq!(wf.status, WorkflowStatus::AwaitingHuman);
+        // Cursor not advanced past the un-executed unit: unit 1 ticked → index 1, unit 2 not ticked.
+        assert_eq!(
+            wf.current_index, 1,
+            "workflow cursor must NOT advance past the un-executed unit 2"
+        );
+
+        // Cursor persisted with next_ord==2 and the FULL clis (binary + headless_invocation).
+        let cursor = get_cursor(&store, "sess-pause-resume")
+            .expect("read cursor")
+            .expect("cursor must be persisted on pause");
+        assert_eq!(cursor.next_ord, 2);
+        assert_eq!(cursor.clis.len(), 2, "full roster persisted");
+        assert!(
+            !cursor.clis[0].binary.is_empty() && cursor.clis[0].binary.contains("fake-a.sh"),
+            "cursor must carry the full binary path, not just the key: {:?}",
+            cursor.clis[0].binary
+        );
+        assert!(
+            cursor.clis[0].headless_invocation.contains("{PROMPT}"),
+            "cursor must carry the full headless_invocation"
+        );
+
+        // ── RESUME — only the store + session id; the cursor supplies the clis. ──
+        let done = resume_session(&mut store, "sess-pause-resume").expect("resume");
+        assert_eq!(done.paused_at, None, "resume runs to completion");
+        assert_eq!(done.units.len(), 2, "both units present after resume");
+        assert!(
+            done.units.iter().all(|o| o.approved),
+            "both units approved after resume (the cursor's clis rebuilt the CLIs)"
+        );
+
+        // Session Completed, workflow Complete, both units Done.
+        let sess = get_session(&store, "sess-pause-resume")
+            .expect("read session")
+            .expect("session exists");
+        assert_eq!(sess.status, SessionStatus::Completed);
+        let wf = get_workflow(&store, &done.workflow_id)
+            .expect("read wf")
+            .expect("wf exists");
+        assert_eq!(wf.status, WorkflowStatus::Complete);
+        assert_eq!(wf.current_index, 2, "cursor advanced past every unit");
+        let units = session_units(&store, "sess-pause-resume").expect("units");
+        assert!(units.iter().all(|u| matches!(u.status, UnitStatus::Done)));
+    }
+
+    /// The FULL AgenticCli survives the cursor's Node round-trip (binary + headless_invocation are
+    /// the real values that went in, not empty and not just the key).
+    #[test]
+    fn full_agentic_cli_survives_cursor_round_trip() {
+        let dir = unique_tempdir("cursor-cli");
+        let clis = two_fake_clis(&dir);
+        let want_binary = clis[0].binary.clone();
+        let want_invocation = clis[0].headless_invocation.clone();
+        let mut store = SqliteStore::in_memory().expect("open store");
+
+        let cursor = ResumeCursor {
+            session_id: "sess-cursor-cli".to_string(),
+            workflow_id: "wf-sess-cursor-cli".to_string(),
+            next_ord: 1,
+            problem: "p".to_string(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: Some("scope".to_string()),
+            governance_mode: GovernanceMode::PretoolHook,
+            sandbox_root: "/tmp/sb".to_string(),
+            timeout_secs: 30,
+            clis,
+            human_confirm: HumanConfirm::All,
+        };
+        put_cursor(&mut store, &cursor).expect("put cursor");
+
+        let got = get_cursor(&store, "sess-cursor-cli")
+            .expect("read cursor")
+            .expect("cursor exists");
+        assert_eq!(got.next_ord, 1);
+        assert_eq!(got.human_confirm, HumanConfirm::All);
+        assert_eq!(got.clis.len(), 2);
+        assert_eq!(
+            got.clis[0].binary, want_binary,
+            "binary must survive the round-trip intact"
+        );
+        assert_eq!(
+            got.clis[0].headless_invocation, want_invocation,
+            "headless_invocation must survive the round-trip intact"
+        );
+        assert!(!got.clis[0].binary.is_empty());
+    }
+
+    /// `HumanConfirm::All` pauses before the FIRST unit (paused_at == first ord, nothing executed).
+    #[test]
+    fn human_confirm_all_pauses_before_first_unit() {
+        let dir = unique_tempdir("hc-all");
+        let clis = two_fake_clis(&dir);
+        let sandbox = dir.join("sandbox");
+        let mut store = SqliteStore::in_memory().expect("open store");
+
+        let paused = run_wrapped(
+            &mut store,
+            clis,
+            "design\nimplement",
+            "sess-hc-all",
+            &sandbox,
+            HumanConfirm::All,
+        );
+        assert_eq!(
+            paused.paused_at,
+            Some(1),
+            "All pauses before the first unit"
+        );
+        assert!(
+            paused.units.is_empty(),
+            "nothing executed before the first unit"
+        );
+
+        let wf = get_workflow(&store, &paused.workflow_id)
+            .expect("read wf")
+            .expect("wf exists");
+        assert_eq!(
+            wf.current_index, 0,
+            "no unit executed → workflow cursor at 0"
+        );
+        assert_eq!(wf.status, WorkflowStatus::AwaitingHuman);
+    }
+
+    /// `HumanConfirm::None` never pauses — identical result to a session run without the gate.
+    #[test]
+    fn human_confirm_none_never_pauses() {
+        let dir = unique_tempdir("hc-none");
+        let clis = two_fake_clis(&dir);
+        let sandbox = dir.join("sandbox");
+        let mut store = SqliteStore::in_memory().expect("open store");
+
+        let result = run_wrapped(
+            &mut store,
+            clis,
+            "design\nimplement",
+            "sess-hc-none",
+            &sandbox,
+            HumanConfirm::None,
+        );
+        assert_eq!(result.paused_at, None, "None never pauses");
+        assert_eq!(result.units.len(), 2, "all units processed");
+        assert!(result.units.iter().all(|o| o.approved));
+
+        // No cursor persisted (never paused).
+        assert!(
+            get_cursor(&store, "sess-hc-none")
+                .expect("read cursor")
+                .is_none(),
+            "a None run must NOT persist a resume cursor"
+        );
+        // Session Completed, workflow Complete.
+        let sess = get_session(&store, "sess-hc-none")
+            .expect("read session")
+            .expect("session exists");
+        assert_eq!(sess.status, SessionStatus::Completed);
+        let wf = get_workflow(&store, &result.workflow_id)
+            .expect("read wf")
+            .expect("wf exists");
+        assert_eq!(wf.status, WorkflowStatus::Complete);
+        assert_eq!(wf.current_index, 2);
+    }
+
+    /// Resume idempotency: resuming an already-Completed session returns the completed result and
+    /// does NOT re-execute or double-tick the workflow (current_index never exceeds unit count).
+    #[test]
+    fn resume_completed_session_is_idempotent_noop() {
+        let dir = unique_tempdir("resume-idem");
+        let clis = two_fake_clis(&dir);
+        let sandbox = dir.join("sandbox");
+        let mut store = SqliteStore::in_memory().expect("open store");
+
+        // Run to completion (no gate).
+        let first = run_wrapped(
+            &mut store,
+            clis,
+            "design\nimplement",
+            "sess-resume-idem",
+            &sandbox,
+            HumanConfirm::None,
+        );
+        assert_eq!(first.paused_at, None);
+
+        let wf_before = get_workflow(&store, &first.workflow_id)
+            .expect("read wf")
+            .expect("wf exists");
+        assert_eq!(wf_before.current_index, 2);
+
+        // Resume the completed session — must be a no-op.
+        let again = resume_session(&mut store, "sess-resume-idem").expect("resume noop");
+        assert_eq!(again.paused_at, None);
+        assert_eq!(again.units.len(), 2, "completed result re-derived");
+        assert_eq!(
+            again.approved, first.approved,
+            "approved count unchanged by idempotent resume"
+        );
+
+        // Workflow cursor did NOT advance past the unit count (no double-tick).
+        let wf_after = get_workflow(&store, &first.workflow_id)
+            .expect("read wf")
+            .expect("wf exists");
+        assert_eq!(
+            wf_after.current_index, 2,
+            "idempotent resume must not double-tick the workflow"
+        );
+        assert!(
+            wf_after.current_index <= again.units.len(),
+            "current_index must never exceed unit count"
+        );
+        assert_eq!(wf_after.status, WorkflowStatus::Complete);
+    }
+
+    /// AgentSession backward-compat: a Node serialized WITHOUT the `human_confirm` field still
+    /// deserializes (defaults to None). Construct the OLD node shape (metadata map missing the field).
+    #[test]
+    fn agent_session_without_human_confirm_field_still_deserializes() {
+        // The pre-field metadata shape (no `human_confirm` key).
+        let old_metadata = serde_json::json!({
+            "id": "sess-old",
+            "workflow_id": "wf-sess-old",
+            "problem": "old problem",
+            "entity_mode": "shared",
+            "collection_scope": "scope-x",
+            "clis": ["fake-a", "fake-b"],
+            "status": "completed"
+        });
+        let serde_json::Value::Object(map) = old_metadata else {
+            panic!("object");
+        };
+
+        let mut node = Node::new(
+            synthetic_symbol(AGENT_SESSION, "sess-old"),
+            NodeKind::Other(AGENT_SESSION.to_string()),
+            "sess-old".to_string(),
+            Language::new(SYMBOL_SCHEME),
+            Location::new(format!("{AGENT_SESSION}/sess-old"), Span::ZERO),
+        );
+        node.metadata = map;
+
+        let session = AgentSession::from_node(&node).expect("old node must still deserialize");
+        assert_eq!(
+            session.human_confirm,
+            HumanConfirm::None,
+            "missing human_confirm field must default to None"
+        );
+        assert_eq!(session.id, "sess-old");
+        assert_eq!(session.status, SessionStatus::Completed);
+    }
+
+    /// AgentSession round-trips the new human_confirm field through to_node/from_node.
+    #[test]
+    fn agent_session_human_confirm_round_trips() {
+        let session = AgentSession {
+            id: "sess-rt".to_string(),
+            workflow_id: "wf-sess-rt".to_string(),
+            problem: "p".to_string(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec!["fake-a".to_string()],
+            status: SessionStatus::AwaitingHuman,
+            human_confirm: HumanConfirm::Before(3),
+        };
+        let node = session.to_node();
+        let back = AgentSession::from_node(&node).expect("round-trip");
+        assert_eq!(back.human_confirm, HumanConfirm::Before(3));
+        assert_eq!(back.status, SessionStatus::AwaitingHuman);
+        assert_eq!(back, session, "full struct must round-trip");
+    }
+
+    /// A second pause DURING resume persists a FRESH cursor (overwrite, not append) at the new ord,
+    /// and resume does NOT re-distribute (the persisted unit assignments are preserved).
+    #[test]
+    fn second_pause_during_resume_overwrites_cursor_and_keeps_assignments() {
+        let dir = unique_tempdir("second-pause");
+        let clis = two_fake_clis(&dir);
+        let sandbox = dir.join("sandbox");
+        let mut store = SqliteStore::in_memory().expect("open store");
+
+        // Three units; pause before unit 2 first.
+        let paused = run_wrapped(
+            &mut store,
+            clis,
+            "a\nb\nc",
+            "sess-second-pause",
+            &sandbox,
+            HumanConfirm::Before(2),
+        );
+        assert_eq!(paused.paused_at, Some(2));
+
+        // Capture the persisted assignment for unit 2 before resume (must NOT be re-distributed).
+        let units_before = session_units(&store, "sess-second-pause").expect("units");
+        let u2_cli_before = units_before
+            .iter()
+            .find(|u| u.ord == 2)
+            .and_then(|u| u.assigned_cli.clone());
+        assert!(
+            u2_cli_before.is_some(),
+            "unit 2 was distributed before the pause"
+        );
+
+        // Now mutate the cursor to pause again before unit 3, then resume.
+        let mut cursor = get_cursor(&store, "sess-second-pause")
+            .expect("read cursor")
+            .expect("cursor");
+        cursor.human_confirm = HumanConfirm::Before(3);
+        put_cursor(&mut store, &cursor).expect("overwrite cursor");
+
+        let paused_again = resume_session(&mut store, "sess-second-pause").expect("resume");
+        assert_eq!(
+            paused_again.paused_at,
+            Some(3),
+            "resume honors the cursor's human_confirm and pauses again before unit 3"
+        );
+
+        // A FRESH cursor was persisted at next_ord==3 (overwrite — only one cursor exists).
+        let cursor2 = get_cursor(&store, "sess-second-pause")
+            .expect("read cursor")
+            .expect("cursor");
+        assert_eq!(
+            cursor2.next_ord, 3,
+            "fresh cursor overwrites at the new ord"
+        );
+
+        // Unit 2's assignment is the SAME as before (resume did NOT re-distribute).
+        let units_after = session_units(&store, "sess-second-pause").expect("units");
+        let u2_cli_after = units_after
+            .iter()
+            .find(|u| u.ord == 2)
+            .and_then(|u| u.assigned_cli.clone());
+        assert_eq!(
+            u2_cli_after, u2_cli_before,
+            "resume must NOT re-distribute — unit 2's council assignment is preserved"
+        );
+        // Units 1 and 2 are Done; unit 3 not yet executed (still distributed/pending).
+        assert!(units_after
+            .iter()
+            .find(|u| u.ord == 1)
+            .is_some_and(|u| matches!(u.status, UnitStatus::Done)));
+        assert!(units_after
+            .iter()
+            .find(|u| u.ord == 2)
+            .is_some_and(|u| matches!(u.status, UnitStatus::Done)));
+        assert!(units_after
+            .iter()
+            .find(|u| u.ord == 3)
+            .is_some_and(|u| !matches!(u.status, UnitStatus::Done)));
     }
 }

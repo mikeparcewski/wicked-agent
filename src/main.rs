@@ -19,8 +19,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use wicked_agent::{
-    get_session, run_session, run_session_wrapped, scope::EntityMode, session_units,
-    GovernanceMode, SessionResult,
+    get_session, resume_session, run_session, run_session_wrapped, scope::EntityMode,
+    session_units, GovernanceMode, HumanConfirm, SessionResult,
 };
 use wicked_apps_core::open_store;
 use wicked_council::AgenticCli;
@@ -42,6 +42,7 @@ fn main() -> ExitCode {
     let result = match cmd {
         "run" => cmd_run(&args[1..]),
         "run-real" => cmd_run_real(&args[1..]),
+        "resume" => cmd_resume(&args[1..]),
         "status" => cmd_status(&args[1..]),
         "register-policy" => cmd_register_policy(&args[1..]),
         "health" => {
@@ -49,7 +50,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         other => Err(anyhow::anyhow!(
-            "unknown command {other:?}; expected one of: run, run-real, status, register-policy, gate-hook, health"
+            "unknown command {other:?}; expected one of: run, run-real, resume, status, register-policy, gate-hook, health"
         )),
     };
 
@@ -68,6 +69,23 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1))
         .map(String::as_str)
+}
+
+/// Parse the `--human-confirm` flag value (`none` | `all` | `before:<N>`) into a [`HumanConfirm`].
+/// Absent or unrecognized ⇒ [`HumanConfirm::None`] (preserves the non-paused default behavior).
+fn parse_human_confirm(args: &[String]) -> HumanConfirm {
+    match flag(args, "--human-confirm") {
+        Some("all") => HumanConfirm::All,
+        Some(s) => match s.strip_prefix("before:") {
+            Some(n) => n
+                .trim()
+                .parse::<u32>()
+                .map(HumanConfirm::Before)
+                .unwrap_or(HumanConfirm::None),
+            None => HumanConfirm::None,
+        },
+        None => HumanConfirm::None,
+    }
 }
 
 /// `run --file <problem.json> [--db <path>] [--entity-mode shared|isolated]`.
@@ -119,11 +137,15 @@ fn cmd_run(args: &[String]) -> anyhow::Result<()> {
 }
 
 /// `run-real --file <problem.json> [--db <path>] [--entity-mode shared|isolated]
-///           [--governance-mode pretool-hook|post-hoc] [--sandbox <dir>] [--timeout-secs <n>]`.
+///           [--governance-mode pretool-hook|post-hoc] [--sandbox <dir>] [--timeout-secs <n>]
+///           [--human-confirm none|all|before:<N>]`.
 ///
 /// Drives the REAL wrapped-CLI path: the council-assigned CLI is launched as a subprocess per unit.
 /// The on-disk DB path is exported as `WICKED_ESTATE_DB` so the generated governance hook (a child
 /// process) opens the SAME shared store the in-process engine wrote the policies to.
+///
+/// `--human-confirm` arms the pause-before-unit gate; on a pause the run persists a resume cursor
+/// and returns with `paused_at` set — continue with `wicked-agent resume --session <id>`.
 fn cmd_run_real(args: &[String]) -> anyhow::Result<()> {
     let file = flag(args, "--file")
         .ok_or_else(|| anyhow::anyhow!("run-real requires --file <problem.json>"))?;
@@ -146,6 +168,7 @@ fn cmd_run_real(args: &[String]) -> anyhow::Result<()> {
     let sandbox = flag(args, "--sandbox")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("wicked-agent-sandbox"));
+    let human_confirm = parse_human_confirm(args);
 
     let clis = spec.resolve_clis()?;
     if clis.is_empty() {
@@ -169,8 +192,32 @@ fn cmd_run_real(args: &[String]) -> anyhow::Result<()> {
         governance_mode,
         &sandbox,
         timeout,
+        human_confirm,
     )?;
 
+    print_result(&result);
+    Ok(())
+}
+
+/// `resume --session <id> [--db <path>] [--human-confirm none|all|before:<N>]`.
+///
+/// Continue a paused wrapped session from its persisted resume cursor (see
+/// [`wicked_agent::resume_session`]). The on-disk DB path is exported as `WICKED_ESTATE_DB` so the
+/// re-launched gate-hook child processes open the SAME shared store. `--human-confirm` is accepted
+/// for symmetry but the cursor's persisted policy is authoritative; it is not overridden here.
+fn cmd_resume(args: &[String]) -> anyhow::Result<()> {
+    let session_id =
+        flag(args, "--session").ok_or_else(|| anyhow::anyhow!("resume requires --session <id>"))?;
+
+    // The ONE shared on-disk store: resolved from --db, else WICKED_ESTATE_DB, else the default path.
+    let db = flag(args, "--db");
+    // Export the resolved DB path so the re-launched gate-hook child processes open the SAME store.
+    if let Some(p) = db {
+        unsafe { std::env::set_var("WICKED_ESTATE_DB", p) };
+    }
+    let mut store = open_store(db)?;
+
+    let result = resume_session(&mut store, session_id)?;
     print_result(&result);
     Ok(())
 }
